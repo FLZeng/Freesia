@@ -13,8 +13,8 @@ The artifact of the *Freesia paper* includes the source code of *Freesia* protot
             |-- revert_patches.sh   # scripts for reverting patches
             |-- xxx.patch           # patches of OP-TEE components
         |-- common.xml              # manifest specifing the revision of OP-TEE components
-        |-- qemu_v8.xml				# manifest specifing the revision of dependencies
-    |-- results						# evaluation results data
+        |-- qemu_v8.xml             # manifest specifing the revision of dependencies
+    |-- results                     # evaluation results data
 ```
 
 ## 2 Environment Setup
