@@ -1,0 +1,480 @@
+diff --git a/core/pta/heap_vuln.c b/core/pta/heap_vuln.c
+new file mode 100644
+index 000000000..c5aad8fb6
+--- /dev/null
++++ b/core/pta/heap_vuln.c
+@@ -0,0 +1,426 @@
++#include <compiler.h>
++#include <kernel/misc.h>
++#include <kernel/mutex.h>
++#include <kernel/tee_time.h>
++#include <kernel/pseudo_ta.h>
++#include <stdio.h>
++#include <string.h>
++#include <string_ext.h>
++#include <stdlib.h>
++#include <utee_syscalls.h>
++#include <util.h>
++
++#include <pta_heap_vuln.h>
++
++static struct mutex user_mutex = MUTEX_INITIALIZER;
++
++// void utee_return(unsigned long ret) __noreturn;
++
++// ================================================================
++// TRACING
++// ================================================================
++
++#define SIGN() (IMSG("%s has been called\n", __FUNCTION__))
++
++// ================================================================
++// DATA STRUCTURES AND BSS/DATA MEMORY
++// ================================================================
++
++#define MAX_USER_COUNT 4
++char const *const SECRET = "TOPSECRETTOPSECRETTOPSECRET";
++
++typedef struct User
++{
++    // There was a bug with the session management, thus we added a validity flag to avoid handling invalid entries:
++    bool is_valid;
++    // The user who wants to authenticate later.
++    char *username;
++    // is set to true after the user has logged in
++    bool is_logged_in;
++    size_t username_len;
++    // unicode passwords can contain null bytes, thus we have to save the length too. *cough* *cough*
++    size_t password_len;
++    // The password that the user has to pass later to succeed authentizing.
++    char *password_from_db;
++} User;
++
++User *users[MAX_USER_COUNT] = {};
++
++// ================================================================
++// HELPER FUNCTIONS
++// ================================================================
++
++void *memdup(const void *mem, size_t size);
++void *memdup(const void *mem, size_t size)
++{
++    void *out = malloc(size);
++
++    if (out != NULL)
++        memcpy(out, mem, size);
++
++    return out;
++}
++
++// ================================================================
++// STUBS
++// ================================================================
++
++static char *aquire_password_by_username(const char *username,
++                                         size_t username_len,
++                                         size_t *out_password_len)
++{
++    *out_password_len = 8;
++    // query highly volatile database containing too short passwords using unescaped query string:
++    return strdup("SQL:p4ssw0rd:FFFFFFFFFFFFFFFF") + 4;
++}
++
++static void release_password(char *password)
++{
++    free(password - 4);
++}
++
++// ================================================================
++// COMMANDS
++// ================================================================
++
++static TEE_Result call_user_enter(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_MEMREF_INPUT, // username
++        TEE_PARAM_TYPE_VALUE_OUTPUT, // user id
++        TEE_PARAM_TYPE_VALUE_OUTPUT, // user addr
++        TEE_PARAM_TYPE_NONE);
++
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    // copy to avoid reading race conditions.
++    size_t username_len = params[0].memref.size;
++    char *username = memdup(params[0].memref.buffer, username_len);
++    if (!username)
++        return TEE_ERROR_OUT_OF_MEMORY;
++
++    // size_t size0 = reg_pair_to_64(params[1].value.a,params[1].value.b);
++    // size_t size2 = params[2].memref.size;
++
++    DMSG("username: %s, len: %d", username, username_len);
++
++    for (size_t i = 0; i < MAX_USER_COUNT; i++)
++    {
++        if (users[i] != NULL)
++        {
++            if (users[i]->username != NULL)
++            {
++                DMSG("[User %i] username: %s, is_valid: %d, is_logged_in: %d",
++                     (int)i, users[i]->username, users[i]->is_valid, users[i]->is_logged_in);
++            }
++            else
++            {
++                DMSG("[User %i] username: NULL, is_valid: %d, is_logged_in: %d",
++                     (int)i, users[i]->is_valid, users[i]->is_logged_in);
++            }
++        }
++        User *user = users[i];
++        // there is a memleak somewhere here, does anybody know how to valgrind a TA?
++        if (user == NULL)
++        {
++            user = calloc(1, sizeof(User));
++            user->is_valid = false;
++            users[i] = user;
++        }
++        if (!user->is_valid)
++        {
++            user->is_valid = true;
++            user->username = username;
++            user->username_len = username_len;
++            user->is_logged_in = false;
++            user->password_from_db = aquire_password_by_username(username, username_len, &user->password_len);
++            // return user id
++            reg_pair_from_64(i, &params[1].value.a, &params[1].value.b);
++            // return user addr
++            reg_pair_from_64((uint64_t)user, &params[2].value.a, &params[2].value.b);
++            //DMSG("[User %i] created at [%p].", (int)i, (void *)user);
++            DMSG("[User %i](%p), is_valid(%p), username(%p), is_logged_in(%p), username_len(%p), password_len(%p), password(%p)",
++            (int)i, (void *)user, &(user->is_valid), &(user->username), &(user->is_logged_in), &(user->username_len),
++            &(user->password_len), &(user->password_from_db));
++            return TEE_SUCCESS;
++        }
++    }
++
++    // cleanup:
++    free(username);
++
++    DMSG("No free user.");
++    return TEE_ERROR_OUT_OF_MEMORY;
++}
++
++static TEE_Result call_user_exit(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT, // user id
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    // mutex_lock(&user_mutex);
++
++    // we don't need to check for validity, the flag stays false.
++    if (users[user_id] == NULL) {
++        DMSG("[User %i] is NULL", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++    if (user_id >= MAX_USER_COUNT) // TODO remove second check for more freedom?
++    {
++        DMSG("Invalid User ID: %i", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    // COPYPASTE 100 TIMES:
++    // I shall not free passwords in memory aquired from other modules, they said. Now it actually doesn't crash anymore.
++    /* free(users[user_id]->password_from_db); */
++    //DMSG("Freeing username(%p) of [User %i](%p): %p", &(users[user_id]->username), (int)user_id, users[user_id], users[user_id]->username);
++    //free(users[user_id]->username);
++    if (users[user_id]->is_valid)
++    {
++        DMSG("Freeing username(%p) of [User %i](%p): %p", &(users[user_id]->username), (int)user_id, users[user_id], users[user_id]->username);
++        free(users[user_id]->username);
++
++        // Wait for 500ms for double free
++        tee_time_wait(500);
++
++        // set the array entry to invalid to allow reusing the array memory
++        users[user_id]->is_valid = false;
++    }
++    else
++    {
++        DMSG("[User %i] is not valid", (int)user_id);
++    }
++
++
++    // mutex_unlock(&user_mutex);
++
++    DMSG("User exited.");
++    return TEE_SUCCESS;
++}
++
++static TEE_Result call_get_user_addr(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT,  // user id
++        TEE_PARAM_TYPE_VALUE_OUTPUT, // user addr
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    // we don't need to check for validity, the flag stays false.
++    if (users[user_id] == NULL || user_id >= MAX_USER_COUNT) // TODO remove second check for more freedom?
++    {
++        DMSG("Invalid User ID");
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    // return id of user
++    User *user = users[user_id];
++    reg_pair_from_64((uint64_t)user, &params[1].value.a, &params[1].value.b);
++    DMSG("[User %i] locates at [%#x]", (int)user_id, (uint64_t)user);
++
++    return TEE_SUCCESS;
++}
++
++static TEE_Result call_tell_me(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT,   // user id
++        TEE_PARAM_TYPE_MEMREF_OUTPUT, // SECRET. Iff logged in.
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    DMSG("Querying User ID: %i", (int)user_id);
++    DMSG("is_valid(%p): %d, is_logged_in(%p): %d", &(users[user_id]->is_valid), users[user_id]->is_valid, &(users[user_id]->is_logged_in), users[user_id]->is_logged_in);
++
++    if (users[user_id] == NULL || user_id >= MAX_USER_COUNT ||
++        !users[user_id]->is_valid || !users[user_id]->is_logged_in)
++    {
++        DMSG("Invalid User ID: %i", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    if (params[1].memref.size < strlen(SECRET) + 1)
++        return TEE_ERROR_OUT_OF_MEMORY;
++
++    memcpy(params[1].memref.buffer, SECRET, strlen(SECRET) + 1);
++    params[1].memref.size = strlen(SECRET) + 1;
++    DMSG("Told you so.");
++    return TEE_SUCCESS;
++}
++
++static TEE_Result call_login(uint32_t param_types, TEE_Param params[4])
++{
++
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT,  // user id
++        TEE_PARAM_TYPE_MEMREF_INPUT, // password
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    if (users[user_id] == NULL || user_id >= MAX_USER_COUNT ||
++        !users[user_id]->is_valid)
++    {
++        DMSG("Invalid User ID: %i", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++    User *user = users[user_id];
++    if (params[1].memref.size == user->password_len &&
++        memcmp(params[1].memref.buffer, user->password_from_db, user->password_len) == 0)
++    {
++        DMSG("[User %i] Logged in!", (int)user_id);
++        user->is_logged_in = true;
++        return TEE_SUCCESS;
++    }
++    DMSG("Wrong p4ssw0rd for [User %i]!", (int)user_id);
++    return TEE_ERROR_BAD_PARAMETERS;
++}
++
++static TEE_Result call_switch_user(uint32_t param_types, TEE_Param params[4])
++{
++    return TEE_ERROR_OUT_OF_MEMORY;
++}
++
++/*
++ * Called when a TA is invoked. sess_ctx hold that value that was
++ * assigned by TA_OpenSessionEntryPoint(). The rest of the paramters
++ * comes from normal world.
++ */
++TEE_Result invoke_command_entry_point(void __maybe_unused *sess_ctx,
++                                      uint32_t cmd_id,
++                                      uint32_t param_types, TEE_Param params[4])
++{
++    // char buffer[1024]; // diagnostics
++    (void)&sess_ctx; /* Unused parameter */
++    SIGN();
++
++    switch (cmd_id)
++    {
++    case TA_HEAP_CMD_USER_ENTER:
++        return call_user_enter(param_types, params);
++    case TA_HEAP_CMD_USER_EXIT:
++        return call_user_exit(param_types, params);
++    case TA_HEAP_CMD_LOGIN:
++        return call_login(param_types, params);
++    case TA_HEAP_CMD_TELL_ME:
++        return call_tell_me(param_types, params);
++    case TA_HEAP_CMD_SWITCH_USER:
++        return call_switch_user(param_types, params);
++    case TA_HEAP_CMD_GET_USER_ADDR:
++        return call_get_user_addr(param_types, params);
++
++    case TA_HEAP_CMD_PANIC:
++        return *((TEE_Result *)NULL);
++
++    default:
++        return TEE_ERROR_NOT_SUPPORTED;
++    }
++}
++
++// ================================================================
++// OPEN & CLOSE ENTRY POINTS
++// ================================================================
++TEE_Result open_session_entry_point(uint32_t param_types,
++                                    TEE_Param params[4],
++                                    void **sess_ctx)
++{
++    SIGN();
++
++    uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
++                                               TEE_PARAM_TYPE_NONE,
++                                               TEE_PARAM_TYPE_NONE,
++                                               TEE_PARAM_TYPE_NONE);
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    (void)&params;
++    (void)&sess_ctx;
++
++    return TEE_SUCCESS;
++}
++
++void close_session_entry_point(void __maybe_unused *sess_ctx)
++{
++    (void)&sess_ctx; /* Unused parameter */
++    SIGN();
++}
++
++TEE_Result create_entry_point(void)
++{
++    SIGN();
++
++    DMSG("Hello, I'm HEAP!\n");
++    DMSG("memcpy is at %p", (void *)memcpy);
++    DMSG("sizeof(User) is 0x%zx", sizeof(User));
++    DMSG("TA_OpenSessionEntryPoint is at %p", (void *)open_session_entry_point);
++    DMSG("TEE_InvokeTACommand is at %p", (void *)invoke_command_entry_point);
++    // DMSG("utee_log is at %p", (void*)utee_log);
++    // DMSG("utee_return is at %p", (void*)utee_return);
++    DMSG("users are at %p", (void *)users);
++    DMSG("SECRET is at %p", (void *)SECRET);
++    // DMSG("TEE_ReadObjectData is at %p", (void*)TEE_ReadObjectData);
++
++    return TEE_SUCCESS;
++}
++
++void destroy_entry_point(void)
++{
++    SIGN();
++
++    for (size_t i = 0; i < MAX_USER_COUNT; ++i) {
++        if (users[i] != NULL) {
++            DMSG("Freeing [User %i]", (int)i);
++            if (users[i]->is_valid && users[i]->username != NULL) {
++                free(users[i]->username);
++                users[i]->username = NULL;
++            }
++            // if (users[i]->password_from_db != NULL) {
++            //     free(users[i]->password_from_db);
++            //     users[i]->password_from_db = NULL;
++            // }
++            free(users[i]);
++            users[i] = NULL;
++        }
++    }
++}
++
++pseudo_ta_register(.uuid = PTA_HEAP_VULN_UUID, .name = TA_NAME,
++                   .flags = PTA_DEFAULT_FLAGS | TA_FLAG_SECURE_DATA_PATH | TA_FLAG_CONCURRENT,
++                   .create_entry_point = create_entry_point,
++                   .destroy_entry_point = destroy_entry_point,
++                   .open_session_entry_point = open_session_entry_point,
++                   .close_session_entry_point = close_session_entry_point,
++                   .invoke_command_entry_point = invoke_command_entry_point);
+\ No newline at end of file
+diff --git a/core/pta/sub.mk b/core/pta/sub.mk
+index 1cb148a32..71dee8135 100644
+--- a/core/pta/sub.mk
++++ b/core/pta/sub.mk
+@@ -14,6 +14,7 @@ srcs-$(CFG_SCMI_PTA) += scmi.c
+ srcs-$(CFG_HWRNG_PTA) += hwrng.c
+ srcs-$(CFG_RTC_PTA) += rtc.c
+ srcs-$(CFG_WIDEVINE_PTA) += widevine.c
++srcs-y += heap_vuln.c
+ 
+ subdirs-y += bcm
+ subdirs-y += stm32mp
+diff --git a/lib/libutee/include/pta_heap_vuln.h b/lib/libutee/include/pta_heap_vuln.h
+new file mode 100644
+index 000000000..8534b6217
+--- /dev/null
++++ b/lib/libutee/include/pta_heap_vuln.h
+@@ -0,0 +1,28 @@
++#ifndef __PTA_HEAP_VULN_H
++#define __PTA_HEAP_VULN_H
++
++/*
++ * Interface to the pac pseudo-TA, which is used for handling
++ * device root of trust function
++ */
++//861b6bfd-e631-f2ba-7e66-15cdbef44c7b
++#define PTA_HEAP_VULN_UUID \
++		{ 0x861b6bfd, 0xe631, 0xf2ba, \
++		{ 0x7e, 0x66, 0x15, 0xcd, 0xbe, 0xf4, 0x4c, 0x7b } }
++
++#define TA_NAME		"heap_vuln.pta"
++
++/*
++ * HEAP_VULN PTA supported commands
++ */
++enum cmd {
++        TA_HEAP_CMD_PANIC,
++        TA_HEAP_CMD_USER_ENTER,
++        TA_HEAP_CMD_USER_EXIT,
++        TA_HEAP_CMD_LOGIN,
++        TA_HEAP_CMD_TELL_ME,
++        TA_HEAP_CMD_SWITCH_USER,
++	TA_HEAP_CMD_GET_USER_ADDR,
++};
++
++#endif /* __PTA_HEAP_VULN_H */
+\ No newline at end of file

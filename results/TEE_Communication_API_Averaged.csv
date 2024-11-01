@@ -1,0 +1,6 @@
+﻿,InitializeContext,AllocateSharedMemory,RegisterSharedMemory,OpenSession,InvokeCommand,CloseSession,ReleaseSharedMemory (Allocated),ReleaseSharedMemory (Registered),FinalizeContext
+OP-TEE,375.1,1529,1050.3,146417.9,1241,2334.4,395.3,318,24.7
+Freesia,394.8,1564.6,1085.4,148562.5,1274.6,2385.1,410.5,332.1,26.5
+,,,,,,,,,
+OP-TEE,1,1,1,1,1,1,1,1,1
+Freesia,1.052519328,1.023283192,1.033419023,1.014647116,1.02707494,1.021718643,1.038451809,1.044339623,1.072874494

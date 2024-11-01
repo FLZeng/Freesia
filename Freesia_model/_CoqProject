@@ -1,0 +1,12 @@
+-Q ./client client
+-Q ./core/kernel core.kernel
+-Q ./core/memory core.memory
+-Q ./lib lib
+
+client/tee_client_api.v
+core/kernel/wait_queue.v
+core/kernel/spinlock.v
+core/kernel/mutex.v
+core/memory/model.v
+lib/basic_types.v
+lib/oneshot.v

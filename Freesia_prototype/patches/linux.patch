@@ -1,0 +1,795 @@
+diff --git a/arch/arm64/include/asm/arm_pmuv3.h b/arch/arm64/include/asm/arm_pmuv3.h
+index 18dc2fb3d7b7..38021773594a 100644
+--- a/arch/arm64/include/asm/arm_pmuv3.h
++++ b/arch/arm64/include/asm/arm_pmuv3.h
+@@ -152,4 +152,25 @@ static inline bool is_pmuv3p5(int pmuver)
+ 	return pmuver >= ID_AA64DFR0_EL1_PMUVer_V3P5;
+ }
+ 
++#define arch_counter_enforce_ordering(val) do {				\
++	unsigned long tmp, _val = (val);						\
++									\
++	asm volatile(							\
++	"	eor	%0, %1, %1\n"					\
++	"	add	%0, sp, %0\n"					\
++	"	ldr	xzr, [%0]"					\
++	: "=r" (tmp) : "r" (_val));					\
++} while (0)
++
++static unsigned long ccnt_read(void)
++{
++	unsigned long cnt;
++
++	asm volatile("isb\n mrs %0, pmccntr_el0\n"
++				 "nop\n"
++		     : "=r" (cnt));
++	arch_counter_enforce_ordering(cnt);
++	return cnt;
++}
++
+ #endif
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 14be5000c5a0..91a1803fbc82 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -425,4 +425,32 @@ static inline size_t probe_subpage_writeable(const char __user *uaddr,
+ 
+ #endif /* CONFIG_ARCH_HAS_SUBPAGE_FAULTS */
+ 
++/*
++ * Insert a random logical tag into the given pointer.
++ */
++#define insert_random_tag(ptr) ({                       \
++        uint64_t __val;                                 \
++        asm("irg %0, %1" : "=r" (__val) : "r" (ptr));   \
++        __val;                                          \
++})
++
++/*
++ * Set the allocation tag on the destination address.
++ */
++#define set_tag(tagged_addr) do {                                \
++	uaccess_enable_privileged();                                   \
++	asm volatile("stg %0, [%0]" : : "r" (tagged_addr) : "memory"); \
++	uaccess_disable_privileged();                                  \
++} while (0)
++
++/*
++ * Get the tag on the given pointer.
++ */
++#define get_tag(tagged_addr) ((tagged_addr) & (0xful << 56))
++
++/*
++ * Clear the tag on the given pointer.
++ */
++#define clear_tag(tagged_addr) ((tagged_addr) & ~(0xful << 56))
++
+ #endif /* __ASM_UACCESS_H */
+diff --git a/drivers/tee/tee_core.c b/drivers/tee/tee_core.c
+index 91932835d0f7..99fe24fbd424 100644
+--- a/drivers/tee/tee_core.c
++++ b/drivers/tee/tee_core.c
+@@ -9,12 +9,21 @@
+ #include <linux/cred.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/tee_drv.h>
+ #include <linux/uaccess.h>
+ #include <crypto/hash.h>
+ #include <crypto/sha1.h>
++
++#include <linux/mman.h>
++// #include <asm/tlbflush.h>
++#include <asm/tlb.h>
++// #include <asm/set_memory.h>
++#include <asm/arm_pmuv3.h>
++#include <asm/uaccess.h>
++
+ #include "tee_private.h"
+ 
+ #define TEE_NUM_DEVICES	32
+@@ -23,6 +32,8 @@
+ 
+ #define TEE_UUID_NS_NAME_SIZE	128
+ 
++#define MTE_GRANULE_SIZE 16
++
+ /*
+  * TEE Client UUID name space identifier (UUIDv4)
+  *
+@@ -540,6 +551,371 @@ static int tee_ioctl_open_session(struct tee_context *ctx,
+ 	return rc;
+ }
+ 
++static pte_t *lookup_address(unsigned long addr) {
++	pgd_t *pgdp;
++	p4d_t *p4dp;
++	pud_t *pudp, pud;
++	pmd_t *pmdp, pmd;
++	pte_t *ptep;
++
++	pgdp = pgd_offset(current->mm, addr);
++	if (pgd_none(READ_ONCE(*pgdp)))
++		return NULL;
++
++	p4dp = p4d_offset(pgdp, addr);
++	if (p4d_none(READ_ONCE(*p4dp)))
++		return NULL;
++
++	pudp = pud_offset(p4dp, addr);
++	pud = READ_ONCE(*pudp);
++	if (pud_none(pud))
++		return NULL;
++
++	pmdp = pmd_offset(pudp, addr);
++	pmd = READ_ONCE(*pmdp);
++	if (pmd_none(pmd))
++		return NULL;
++
++	ptep = pte_offset_map(&pmd, addr);
++	return ptep;
++}
++
++static int set_param_prot(struct tee_param param,
++			  struct tee_param_prot_data *data, int new_prot)
++{
++	int err = 0;
++	struct tee_shm *shm;
++	unsigned long addr, start, end, nstart, tmp;
++	struct vm_area_struct *vma, *prev;
++	struct vma_iterator vmi;
++	struct mmu_gather tlb;
++	unsigned long mask_off_old_prots;
++
++	shm = param.u.memref.shm;
++
++	addr = untagged_addr(shm->addr);
++	start = roundup(addr, PAGE_SIZE);
++	end = rounddown(addr + shm->size, PAGE_SIZE);
++	// end = start + PAGE_ALIGN(shm->size);
++
++	if (end <= start)
++		return -ENOMEM;
++
++	// if (mmap_write_lock_killable(current->mm))
++	// 	return -EINTR;
++
++	// vma_iter_init(&vmi, current->mm, start);
++	// vma = vma_find(&vmi, end);
++	// if (!vma) {
++	// 	err = -EINVAL;
++	// 	goto out;
++	// }
++
++	// printk("[set_param_prot] shm.addr: %#x, shm.size: %#x, start: %#x, end: %#x, len: %#x, vma.start: %#x, vma.end: %#x, flag: %#x\n",
++	//        shm->addr, shm->size, start, end, end - start, vma->vm_start,
++	//        vma->vm_end, vma->vm_flags);
++
++	// prev = vma_prev(&vmi);
++	// if (start > vma->vm_start)
++	// 	prev = vma;
++
++	// pgprot_t page_prot = vma->vm_page_prot;
++	// unsigned long vm_flags = vma->vm_flags;
++	// pgprot_t prot = vm_get_page_prot(vm_flags);
++
++	// data->old_prot = PROT_NONE;
++	// data->is_prot_set = 0;
++
++	// if (vm_flags & VM_READ) {
++	// 	data->old_prot |= PROT_READ;
++	// }
++	// if (vm_flags & VM_WRITE) {
++	// 	data->old_prot |= PROT_WRITE;
++	// }
++
++	// printk("[set_param_prot] old_prot: %#x, new_prot: %#x\n",
++	//        data->old_prot, new_prot);
++
++	// if (data->old_prot != new_prot) {
++	// 	data->is_prot_set = 1;
++	// }
++
++	if (data->is_prot_set) {
++		// Method 1
++		// Effective
++		err = do_mprotect(start, end - start, new_prot);
++		// printk("[set_param_prot] do_mprotect done: (%#x) %#x, err %d\n",
++		//        start, end - start, err);
++
++		// Method 2
++		// Ineffective: mprotect reference to null
++		// int (*mprotect_p)(void *addr, size_t len, int prot);
++		// mprotect_p = (int (*)(void *addr, size_t len, int prot))kallsyms_lookup_name("sys_mprotect");
++		// int err = mprotect_p(shm->addr, shm->size, new_prot);
++		// printk("[set_param_prot] mprotect_p: (%#x) %u, err %d\n",
++		//        shm->addr, shm->size, err);
++
++		// Method 3
++		// Ineffective: set_memory_ro return err EINVAL
++		// int err = set_memory_ro(shm->addr, shm->size / PAGE_SIZE);
++		// printk("[set_param_prot] set_memory_ro: (%#x) %u, err %d\n",
++		//        shm->addr, shm->size / PAGE_SIZE, err);
++
++		// Method 4
++		// Effective
++		// unsigned long mask_off_old_flags;
++		// unsigned long newflags;
++		// pte_t *ptep;
++		// ptep = lookup_address(shm->addr);
++		// if (unlikely(ptep == NULL) || !pte_present(*ptep)) {
++		// 	printk("[set_param_prot] lookup_address: pte not found\n");
++		// } else {
++		// 	mask_off_old_flags = VM_ACCESS_FLAGS | VM_FLAGS_CLEAR;
++		// 	newflags = calc_vm_prot_bits(new_prot, -1);
++		// 	newflags |= (vma->vm_flags & ~mask_off_old_flags);
++		// 	vma_start_write(vma);
++		// 	vm_flags_reset(vma, newflags);
++		// 	vma_set_page_prot(vma);
++
++		// 	pte_t pte = READ_ONCE(*ptep);
++		// 	if (new_prot & PROT_WRITE) {
++		// 		pte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));
++		// 		pte = set_pte_bit(pte, __pgprot(PTE_WRITE));
++		// 	} else {
++		// 		pte = pte_wrprotect(pte);
++		// 	}
++		// 	printk("[set_param_prot] set_pte\n");
++		// 	set_pte(ptep, pte);
++
++		// 	// flush_tlb_page(vma, start);
++		// 	flush_tlb_range(vma, start, end);
++		// 	// flush_tlb_kernel_range(start, end);
++		// 	// flush_tlb_all();
++		// }
++	}
++
++	// vma_iter_init(&vmi, current->mm, start);
++	// vma = vma_find(&vmi, end);
++	// printk("[set_param_prot] vma->vm_start: %#x, vma->vm_end: %#x, len: %#x, vma->vm_flags: %#x, is_prot_set: %d\n",
++	//        vma->vm_start, vma->vm_end, vma->vm_end - vma->vm_start, vma->vm_flags,
++	//        data->is_prot_set);
++out:
++	// mmap_write_unlock(current->mm);
++	return err;
++}
++
++static void store_param_prot(struct tee_param *params,
++			     struct tee_param_prot_data *data, u32 num_params)
++{
++	struct tee_shm *shm;
++	unsigned long addr, start, end, nstart, tmp;
++	bool is_covered;
++	struct vm_area_struct *vma, *prev;
++	struct vma_iterator vmi;
++
++	if (!params) {
++		return;
++	}
++
++	for (u32 n = 0; n < num_params; n++) {
++		data[n].start = 0;
++		data[n].end = 0;
++		data[n].old_prot = PROT_NONE;
++		data[n].is_prot_set = 0;
++		data[n].is_tag_set = 0;
++		shm = params[n].u.memref.shm;
++
++		if (tee_param_is_memref(params + n) && shm) {
++			addr = untagged_addr(shm->addr);
++			start = roundup(addr, PAGE_SIZE);
++			end = rounddown(addr + shm->size, PAGE_SIZE);
++
++			is_covered = false;
++			for (u32 i = 0; i < n; i++) {
++				if (data[i].is_prot_set &&
++				    start >= data[i].start &&
++				    end <= data[i].end) {
++					is_covered = true;
++					break;
++				}
++			}
++			if (is_covered) {
++				continue;
++			}
++
++			if (addr != start || end != (addr + shm->size)) {
++				data[n].is_tag_set = 1;
++			}
++			// printk("[store_param_prot] [%#x, %#x], [%#x, %#x] %d\n",
++			//        addr, addr + shm->size, start, end,
++			//        data[n].is_tag_set);
++
++			if (end <= start) {
++				continue;
++			}
++			data[n].start = start;
++			data[n].end = end;
++
++			vma_iter_init(&vmi, current->mm, start);
++			vma = vma_find(&vmi, end);
++			if (!vma) {
++				continue;
++			}
++
++			prev = vma_prev(&vmi);
++			if (start > vma->vm_start)
++				prev = vma;
++
++			unsigned long vm_flags = vma->vm_flags;
++
++			if (vm_flags & VM_READ) {
++				data[n].old_prot |= PROT_READ;
++			}
++			if (vm_flags & VM_WRITE) {
++				data[n].old_prot |= PROT_WRITE;
++				data[n].is_prot_set = 1;
++			}
++		}
++	}
++}
++
++static void set_buffer_tag(unsigned long addr, size_t size) {
++	size_t granule_num;
++	unsigned long start, end, tagged_start;
++
++	// set page attribute with PROT_MTE
++	start = rounddown(addr, PAGE_SIZE);
++	end = roundup(addr + size, PAGE_SIZE);
++	do_mprotect(start, end - start, PROT_READ | PROT_WRITE | PROT_MTE);
++	// printk("[set_buffer_tag] mprotect on buffer %#lx (%#x)\n", start, end - start);
++
++	// set memory tag
++	start = roundup(addr, MTE_GRANULE_SIZE);
++	end = rounddown(addr + size, MTE_GRANULE_SIZE);
++	granule_num = (end - start) / MTE_GRANULE_SIZE;
++	// MOD: fix the case where the difference is less than 8
++	if (end <= start) {
++		return;
++	}
++
++	/* set the logical and allocation tags */
++	tagged_start = insert_random_tag(start);
++	// printk("[set_buffer_tag] about to set tag on buffer %#lx (%#x),  %#lx (%#x) \n",
++	    //    addr, size, tagged_start, granule_num);
++	for (size_t n = 0; n < granule_num; n++) {
++		set_tag(tagged_start + n * MTE_GRANULE_SIZE);
++	}
++
++	// printk("[set_buffer_tag] set tag on buffer %#lx (%#x),  %#lx (%#x) \n",
++	    //    addr, size, tagged_start, granule_num);
++}
++
++static void clear_buffer_tag(unsigned long addr, size_t size) {
++	size_t granule_num;
++	unsigned long start, end, untagged_start, tag;
++
++	// set page attribute without PROT_MTE
++	start = rounddown(addr, PAGE_SIZE);
++	end = roundup(addr + size, PAGE_SIZE);
++	do_mprotect(start, end - start, PROT_READ | PROT_WRITE);
++	// printk("[clear_buffer_tag] mprotect on buffer %#lx (%#x)\n", start, end-start);
++
++	start = roundup(addr, MTE_GRANULE_SIZE);
++	end = rounddown(addr + size, MTE_GRANULE_SIZE);
++	granule_num = (end - start) / MTE_GRANULE_SIZE;
++	// MOD: fix the case where the difference is less than 8
++	if (end <= start) {
++		return;
++	}
++
++	/* clear the tag */
++	tag = get_tag(start);
++	untagged_start = tag ^ start;
++	// untagged_start = clear_tag(start);
++	for (size_t n = 0; n < granule_num; n++) {
++		set_tag(untagged_start + n * MTE_GRANULE_SIZE);
++	}
++
++	// printk("[clear_buffer_tag] clear tag (%lx) on buffer %#lx (%#x),  %#lx (%#x) \n",
++	//        tag, addr, size, untagged_start, granule_num);
++}
++
++static void set_param_tag(struct tee_param param) {
++	struct tee_shm *shm;
++	size_t size;
++	unsigned long addr;
++
++	shm = param.u.memref.shm;
++	addr = shm->addr;
++	size = shm->size;
++
++	set_buffer_tag(addr, size);
++}
++
++static void clear_param_tag(struct tee_param param) {
++	struct tee_shm *shm;
++	size_t size, granule_num;
++	unsigned long addr, start, end, untagged_start, tag;
++
++	shm = param.u.memref.shm;
++	addr = shm->addr;
++	size = shm->size;
++
++	clear_buffer_tag(addr, size);
++}
++
++static void set_param_tag_seg(struct tee_param param) {
++	struct tee_shm *shm;
++	size_t size;
++	unsigned long addr, start, end, seg1_start, seg1_end, seg2_start, seg2_end;
++
++	shm = param.u.memref.shm;
++	addr = shm->addr;
++	size = shm->size;
++
++	seg1_start = addr;
++	seg1_end = min(roundup(addr, PAGE_SIZE), addr + size);
++	seg2_start = max(rounddown(addr + size, PAGE_SIZE), addr);
++	seg2_end = addr + size;
++
++	// printk("[set_param_tag_seg] seg1: %#x %#x, seg2:  %#x %#x\n",
++	    //    seg1_start, seg1_end, seg2_start, seg2_end);
++
++	if (seg1_end > seg1_start) {
++		set_buffer_tag(seg1_start, seg1_end - seg1_start);
++	}
++
++	if (seg2_end > seg2_start && seg2_start >= seg1_end) {
++		set_buffer_tag(seg2_start, seg2_end - seg2_start);
++	}
++}
++
++static void clear_param_tag_seg(struct tee_param param) {
++	struct tee_shm *shm;
++	size_t size;
++	unsigned long addr, seg1_start, seg1_end, seg2_start, seg2_end;
++
++	shm = param.u.memref.shm;
++	addr = shm->addr;
++	size = shm->size;
++
++	seg1_start = addr;
++	seg1_end = min(roundup(addr, PAGE_SIZE), addr + size);
++	seg2_start = max(rounddown(addr + size, PAGE_SIZE), addr);
++	seg2_end = addr + size;
++
++	// printk("[clear_param_tag_seg] seg1: %#x %#x, seg2:  %#x %#x\n",
++	    //    seg1_start, seg1_end, seg2_start, seg2_end);
++
++	if (seg1_end > seg1_start) {
++		clear_buffer_tag(seg1_start, seg1_end - seg1_start);
++	}
++
++	if (seg2_end > seg2_start && seg2_start >= seg1_end) {
++		clear_buffer_tag(seg2_start, seg2_end - seg2_start);
++	}
++}
++
+ static int tee_ioctl_invoke(struct tee_context *ctx,
+ 			    struct tee_ioctl_buf_data __user *ubuf)
+ {
+@@ -550,6 +926,7 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
+ 	struct tee_ioctl_invoke_arg arg;
+ 	struct tee_ioctl_param __user *uparams = NULL;
+ 	struct tee_param *params = NULL;
++	struct tee_param_prot_data *params_data = NULL;
+ 
+ 	if (!ctx->teedev->desc->ops->invoke_func)
+ 		return -EINVAL;
+@@ -577,7 +954,45 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
+ 		rc = params_from_user(ctx, params, arg.num_params, uparams);
+ 		if (rc)
+ 			goto out;
++		params_data = kcalloc(arg.num_params,
++				      sizeof(struct tee_param_prot_data),
++				      GFP_KERNEL);
++		if (!params_data) {
++			rc = -ENOMEM;
++			goto out;
++		}
++		// MOD: store params prot of memref type
++		store_param_prot(params, params_data, arg.num_params);
++	}
++
++	// u64 cycle_start = ccnt_read();
++	// MOD: set params of memref type as inaccessible
++	if (params) {
++		for (n = 0; n < arg.num_params; n++) {
++			if (params_data[n].is_prot_set) {
++				// u64 cycle_start = ccnt_read();
++				set_param_prot(params[n], &params_data[n], PROT_NONE);
++				// u64 cycle_end = ccnt_read();
++				// printk("[tee_ioctl_invoke] set param prot: %lu - %lu = [%lu] cycles\n",
++							// cycle_end, cycle_start, cycle_end - cycle_start);
++			}
++			if (params_data[n].is_tag_set) {
++				// u64 cycle_start = ccnt_read();
++				set_param_tag_seg(params[n]);
++				// u64 cycle_end = ccnt_read();
++				// printk("[tee_ioctl_invoke] set param tag: %lu - %lu = [%lu] cycles\n",
++				// 			cycle_end, cycle_start, cycle_end - cycle_start);
++			}
++
++			// if (tee_param_is_memref(params + n) &&
++			//     params[n].u.memref.shm) {
++			// 	set_param_tag(params[n]);
++			// }
++		}
+ 	}
++	// u64 cycle_end = ccnt_read();
++	// printk("[tee_ioctl_invoke] set param prot: %lu - %lu = [%lu] cycles\n",
++	//        cycle_end, cycle_start, cycle_end - cycle_start);
+ 
+ 	rc = ctx->teedev->desc->ops->invoke_func(ctx, &arg, params);
+ 	if (rc)
+@@ -594,10 +1009,42 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
+ 		/* Decrease ref count for all valid shared memory pointers */
+ 		for (n = 0; n < arg.num_params; n++)
+ 			if (tee_param_is_memref(params + n) &&
+-			    params[n].u.memref.shm)
++			    params[n].u.memref.shm) {
++				// MOD: restore params' access prot
++				if (params_data) {
++					// u64 cycle_start = ccnt_read();
++					if (params_data[n].is_prot_set) {
++						// u64 cycle_start = ccnt_read();
++						set_param_prot(params[n],
++										&params_data[n],
++										params_data[n].old_prot);
++						// u64 cycle_end = ccnt_read();
++						// printk("[tee_ioctl_invoke] restore param prot: %lu - %lu = [%lu] cycles\n",
++						// 		cycle_end, cycle_start,
++						// 		cycle_end - cycle_start);
++					}
++					if (params_data[n].is_tag_set) {
++						// u64 cycle_start = ccnt_read();
++						clear_param_tag_seg(params[n]);
++						// u64 cycle_end = ccnt_read();
++						// printk("[tee_ioctl_invoke] clear param tag: %lu - %lu = [%lu] cycles\n",
++						// 		cycle_end, cycle_start,
++						// 		cycle_end - cycle_start);
++					}
++					// u64 cycle_end = ccnt_read();
++					// printk("[tee_ioctl_invoke] restore param prot done: %lu - %lu = [%lu] cycles\n",
++					// 			cycle_end, cycle_start,
++					// 			cycle_end - cycle_start);
++				}
++				// clear_param_tag(params[n]);
+ 				tee_shm_put(params[n].u.memref.shm);
++			}
+ 		kfree(params);
+ 	}
++	// MOD: release tee param prot data
++	if (params_data) {
++		kfree(params_data);
++	}
+ 	return rc;
+ }
+ 
+diff --git a/drivers/tee/tee_shm.c b/drivers/tee/tee_shm.c
+index 673cf0359494..3a5eb4a57fc5 100644
+--- a/drivers/tee/tee_shm.c
++++ b/drivers/tee/tee_shm.c
+@@ -247,6 +247,8 @@ register_shm_helper(struct tee_context *ctx, unsigned long addr,
+ 	shm->id = id;
+ 	addr = untagged_addr(addr);
+ 	start = rounddown(addr, PAGE_SIZE);
++	// MOD: set shm addr
++	shm->addr = addr;
+ 	shm->offset = addr - start;
+ 	shm->size = length;
+ 	num_pages = (roundup(addr + length, PAGE_SIZE) - start) / PAGE_SIZE;
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index bf5d0b1b16f4..1649243cbda0 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -448,7 +448,13 @@ extern unsigned int kobjsize(const void *objp);
+ #ifndef VM_ARCH_CLEAR
+ # define VM_ARCH_CLEAR	VM_NONE
+ #endif
++
++// MOD: add VM_MTE to VM_FLAGS_CLEAR
++#if defined(CONFIG_ARM64_MTE)
++#define VM_FLAGS_CLEAR	(ARCH_VM_PKEY_FLAGS | VM_ARCH_CLEAR | VM_MTE)
++#else
+ #define VM_FLAGS_CLEAR	(ARCH_VM_PKEY_FLAGS | VM_ARCH_CLEAR)
++#endif
+ 
+ /*
+  * mapping from the currently active vm_flags protection bits (the
+@@ -2525,6 +2531,8 @@ extern long change_protection(struct mmu_gather *tlb,
+ extern int mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
+ 	  struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ 	  unsigned long start, unsigned long end, unsigned long newflags);
++// MOD: add do_mprotect
++extern int do_mprotect(unsigned long start, size_t len, unsigned long prot);
+ 
+ /*
+  * doesn't attempt to fault and will return short.
+diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
+index 911ddf92dcee..ce14bacfe4a9 100644
+--- a/include/linux/tee_drv.h
++++ b/include/linux/tee_drv.h
+@@ -77,6 +77,15 @@ struct tee_param {
+ 	} u;
+ };
+ 
++// MOD: add prot
++struct tee_param_prot_data {
++	__u64 start;
++	__u64 end;
++	__u32 old_prot;
++	__u32 is_prot_set;
++	__u32 is_tag_set;
++};
++
+ /**
+  * struct tee_driver_ops - driver operations vtable
+  * @get_version:	returns version of driver
+@@ -198,6 +207,7 @@ int tee_session_calc_client_uuid(uuid_t *uuid, u32 connection_method,
+  * @flags:	defined by TEE_SHM_* in tee_drv.h
+  * @id:		unique id of a shared memory object on this device, shared
+  *		with user space
++ * @addr:	process virtual address of the shared memory
+  * @sec_world_id:
+  *		secure world assigned id of this shared memory object, not
+  *		used by all drivers
+@@ -217,6 +227,8 @@ struct tee_shm {
+ 	u32 flags;
+ 	int id;
+ 	u64 sec_world_id;
++	// MOD: add addr
++	unsigned long addr;
+ };
+ 
+ /**
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index b94fbb45d5c7..5eebfe884949 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -834,6 +834,141 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 	return error;
+ }
+ 
++int do_mprotect(unsigned long start, size_t len, unsigned long prot)
++{
++	unsigned long nstart, end, tmp, reqprot;
++	struct vm_area_struct *vma, *prev;
++	int error;
++	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
++	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
++				(prot & PROT_READ);
++	struct mmu_gather tlb;
++	struct vma_iterator vmi;
++
++	start = untagged_addr(start);
++
++	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
++	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
++		return -EINVAL;
++
++	if (start & ~PAGE_MASK)
++		return -EINVAL;
++	if (!len)
++		return 0;
++	len = PAGE_ALIGN(len);
++	end = start + len;
++	if (end <= start)
++		return -ENOMEM;
++	if (!arch_validate_prot(prot, start))
++		return -EINVAL;
++
++	reqprot = prot;
++
++	if (mmap_write_lock_killable(current->mm))
++		return -EINTR;
++
++	vma_iter_init(&vmi, current->mm, start);
++	vma = vma_find(&vmi, end);
++	error = -ENOMEM;
++	if (!vma)
++		goto out;
++
++	if (unlikely(grows & PROT_GROWSDOWN)) {
++		if (vma->vm_start >= end)
++			goto out;
++		start = vma->vm_start;
++		error = -EINVAL;
++		if (!(vma->vm_flags & VM_GROWSDOWN))
++			goto out;
++	} else {
++		if (vma->vm_start > start)
++			goto out;
++		if (unlikely(grows & PROT_GROWSUP)) {
++			end = vma->vm_end;
++			error = -EINVAL;
++			if (!(vma->vm_flags & VM_GROWSUP))
++				goto out;
++		}
++	}
++
++	prev = vma_prev(&vmi);
++	if (start > vma->vm_start)
++		prev = vma;
++
++	tlb_gather_mmu(&tlb, current->mm);
++	nstart = start;
++	tmp = vma->vm_start;
++	for_each_vma_range(vmi, vma, end) {
++		unsigned long mask_off_old_flags;
++		unsigned long newflags;
++
++		if (vma->vm_start != tmp) {
++			error = -ENOMEM;
++			break;
++		}
++
++		/* Does the application expect PROT_READ to imply PROT_EXEC */
++		if (rier && (vma->vm_flags & VM_MAYEXEC))
++			prot |= PROT_EXEC;
++
++		/*
++		 * Each mprotect() call explicitly passes r/w/x permissions.
++		 * If a permission is not passed to mprotect(), it must be
++		 * cleared from the VMA.
++		 */
++		mask_off_old_flags = VM_ACCESS_FLAGS | VM_FLAGS_CLEAR;
++		newflags = calc_vm_prot_bits(prot, -1);
++		newflags |= (vma->vm_flags & ~mask_off_old_flags);
++
++		/* newflags >> 4 shift VM_MAY% in place of VM_% */
++		if ((newflags & ~(newflags >> 4)) & VM_ACCESS_FLAGS) {
++			error = -EACCES;
++			break;
++		}
++
++		if (map_deny_write_exec(vma, newflags)) {
++			error = -EACCES;
++			break;
++		}
++
++		/* Allow architectures to sanity-check the new flags */
++		if (!arch_validate_flags(newflags)) {
++			error = -EINVAL;
++			break;
++		}
++
++		error = security_file_mprotect(vma, reqprot, prot);
++		if (error)
++			break;
++
++		tmp = vma->vm_end;
++		if (tmp > end)
++			tmp = end;
++
++		if (vma->vm_ops && vma->vm_ops->mprotect) {
++			error = vma->vm_ops->mprotect(vma, nstart, tmp, newflags);
++			if (error)
++				break;
++		}
++
++		error = mprotect_fixup(&vmi, &tlb, vma, &prev, nstart, tmp, newflags);
++		if (error)
++			break;
++
++		tmp = vma_iter_end(&vmi);
++		nstart = tmp;
++		prot = reqprot;
++	}
++	tlb_finish_mmu(&tlb);
++
++	if (!error && tmp < end)
++		error = -ENOMEM;
++
++out:
++	mmap_write_unlock(current->mm);
++	return error;
++}
++
+ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot)
+ {

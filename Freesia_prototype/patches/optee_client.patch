@@ -1,0 +1,774 @@
+diff --git a/libteec/CMakeLists.txt b/libteec/CMakeLists.txt
+index 89ea757..b38f221 100644
+--- a/libteec/CMakeLists.txt
++++ b/libteec/CMakeLists.txt
+@@ -21,6 +21,7 @@ set(CFG_TEE_CLIENT_LOG_FILE "${CMAKE_INSTALL_LOCALSTATEDIR}/lib/tee/teec.log" CA
+ ################################################################################
+ set(SRC
+ 	src/tee_client_api.c
++	src/teec_mutex_pool.c
+ 	src/teec_trace.c
+ )
+ 
+@@ -62,6 +63,8 @@ target_link_libraries(teec
+ ################################################################################
+ # Install targets
+ ################################################################################
++# FIXME: This should in someway harmonize with CFG_TEE_CLIENT_LOAD_PATH
++# FIXME: Should we change this to /usr/local/lib?
+ install(TARGETS teec LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+                       ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+ 
+diff --git a/libteec/Makefile b/libteec/Makefile
+index 6e80a50..234e914 100644
+--- a/libteec/Makefile
++++ b/libteec/Makefile
+@@ -18,6 +18,7 @@ LIB_MAJ_MIN	:= $(LIB_NAME).$(MAJOR_VERSION).$(MINOR_VERSION)
+ LIB_MAJ_MIN_P	:= $(LIB_NAME).$(MAJOR_VERSION).$(MINOR_VERSION).$(PATCH_VERSION)
+ 
+ TEEC_SRCS	:= tee_client_api.c \
++		   teec_mutex_pool.c \
+ 		   teec_trace.c
+ 
+ TEEC_SRC_DIR	:= src
+diff --git a/libteec/include/tee_client_api.h b/libteec/include/tee_client_api.h
+index ba0cdc3..57b1397 100644
+--- a/libteec/include/tee_client_api.h
++++ b/libteec/include/tee_client_api.h
+@@ -280,6 +280,7 @@ typedef struct {
+ 		int fd;
+ 		bool reg_mem;
+ 		bool memref_null;
++		bool is_initialized;
+ 	} imp;
+ } TEEC_Context;
+ 
+diff --git a/libteec/include/teec_mutex_pool.h b/libteec/include/teec_mutex_pool.h
+new file mode 100644
+index 0000000..d9ae24d
+--- /dev/null
++++ b/libteec/include/teec_mutex_pool.h
+@@ -0,0 +1,139 @@
++#ifndef TEEC_MUTEX_POOL_H
++#define TEEC_MUTEX_POOL_H
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <unistd.h>
++
++/**
++ * Defines the maximum size of the mutex pool.
++ */
++#define TEEC_MUTEX_POOL_MAX_SIZE  32
++
++/** 
++ * Invalid key
++ */
++#define POOL_INVALID_KEY          0
++
++/** 
++ * Transform a pointer to a key.
++ */
++#define ADDR_TO_KEY(ptr)  (uintptr_t)(ptr)
++
++
++// #define TEEC_MUTEX_POOL_INITIALIZER {{ .key = {0}, .val = {0} }}
++
++/**
++ * struct TEEC_Mutex_Pool
++ * 
++ * @param capacity  Capacity of the pool.
++ * @param size      Number of entries in the pool.
++ * @param key       List of addr keys.
++ * @param val       List of mutex values.
++ * 
++ * A TEEC_Mutex_Pool object contains a list of addr/mutex associations.
++ * Each association is identified by a unique unsigned long key.
++ */
++typedef struct {
++    // size_t capacity;
++    // size_t size;
++    uint64_t key[TEEC_MUTEX_POOL_MAX_SIZE];
++    pthread_mutex_t val[TEEC_MUTEX_POOL_MAX_SIZE];
++} TEEC_Mutex_Pool;
++
++/**
++ * TEEC_Mutex_Mutex_Pool - Create a new TEEC_Mutex_Pool object.
++ * 
++ * @param    capacity    Optional initial capacity of the map.
++ * @return   A newly allocated TEEC_Mutex_Pool object.
++ * 
++ * This function allocates a new TEEC_Mutex_Pool object of given capacity and
++ * returns it. If you do not know in advance (roughly) the number of entries
++ * in the map, give capacity=0.
++ */
++TEEC_Mutex_Pool TEEC_Mutex_Pool_Create(int capacity);
++
++/**
++ * TEEC_Pool_Destroy - Destroy a TEEC_Mutex_Pool object.
++ * 
++ * @param    pool   TEEC_Mutex_Pool object to deallocate.
++ * 
++ * Deallocate given pool object and all memory associated to it.
++ */
++/*--------------------------------------------------------------------------*/
++void TEEC_Mutex_Pool_Destroy(TEEC_Mutex_Pool *pool);
++
++/*-------------------------------------------------------------------------*/
++/**
++ * TEEC_Mutex_Pool_Get - Get a mutex from a pool.
++ * 
++ * @param    pool    TEEC_Mutex_Pool object to search.
++ * @param    key     Key to look for in the pool.
++ * @return   a pointer to internally allocated mutex.
++ * 
++ * This function locates a key in a pool and returns a pointer to its
++ * value (mutex), or null pointer if no such key can be found in pool
++ * and the pool is used up.
++ */
++/*--------------------------------------------------------------------------*/
++pthread_mutex_t *TEEC_Mutex_Pool_Get(TEEC_Mutex_Pool *pool, uint64_t key);
++
++/*-------------------------------------------------------------------------*/
++/**
++ * TEEC_Mutex_Pool_Unset - Remove a key in a pool.
++ * 
++ * @param    pool    TEEC_Mutex_Pool object to search.
++ * @param    key     Key to remove.
++ * 
++ * This function removes a key in a pool. Nothing is done if the
++ * key cannot be found.
++ */
++/*--------------------------------------------------------------------------*/
++void TEEC_Mutex_Pool_Unset(TEEC_Mutex_Pool *pool, uint64_t key);
++
++/*-------------------------------------------------------------------------*/
++/**
++  @brief    Set a value in a map.
++  @param    d       map object to modify.
++  @param    key     Key to modify or add.
++  @param    val     Value to add.
++  @return   int     0 if Ok, anything else otherwise
++
++  If the given key is found in the map, the associated value is
++  replaced by the provided one. If the key cannot be found in the
++  map, it is added to it.
++
++  It is Ok to provide a NULL value for val, but NULL values for the map
++  or the key are considered as errors: the function will return immediately
++  in such a case.
++
++  Notice that if you map_set a variable to NULL, a call to
++  map_get will return a NULL value: the variable will be found, and
++  its value (NULL) is returned. In other words, setting the variable
++  content to NULL is equivalent to deleting the variable from the
++  map. It is not possible (in this implementation) to have a key in
++  the map without value.
++
++  This function returns non-zero in case of failure.
++ */
++/*--------------------------------------------------------------------------*/
++int map_set(TEEC_Mutex_Pool *vd, const char *key, void *val);
++
++/*-------------------------------------------------------------------------*/
++/**
++  @brief    Delete a key in a map
++  @param    d       map object to modify.
++  @param    key     Key to remove.
++  @return   void
++
++  This function deletes a key in a map. Nothing is done if the
++  key cannot be found.
++ */
++/*--------------------------------------------------------------------------*/
++void map_unset(TEEC_Mutex_Pool *d, const char *key);
++
++#endif
+diff --git a/libteec/src/tee_client_api.c b/libteec/src/tee_client_api.c
+index 512fdac..ba95bb1 100644
+--- a/libteec/src/tee_client_api.c
++++ b/libteec/src/tee_client_api.c
+@@ -38,6 +38,7 @@
+ #include <sys/types.h>
+ #include <tee_client_api_extensions.h>
+ #include <tee_client_api.h>
++#include <teec_mutex_pool.h>
+ #include <teec_trace.h>
+ #include <unistd.h>
+ 
+@@ -63,6 +64,10 @@
+ #define SHM_FLAG_SHADOW_BUFFER_ALLOCED	(1u << 1)
+ 
+ static pthread_mutex_t teec_mutex = PTHREAD_MUTEX_INITIALIZER;
++// MOD: mutex for shared memory
++static pthread_mutex_t teec_shm_mutex = PTHREAD_MUTEX_INITIALIZER;
++// MOD: mutex pool
++static TEEC_Mutex_Pool teec_mutex_pool = { .key = {0}, .val = {PTHREAD_MUTEX_INITIALIZER} };
+ 
+ static void teec_mutex_lock(pthread_mutex_t *mu)
+ {
+@@ -166,15 +171,28 @@ TEEC_Result TEEC_InitializeContext(const char *name, TEEC_Context *ctx)
+ 	if (!ctx)
+ 		return TEEC_ERROR_BAD_PARAMETERS;
+ 
++	// MOD: avoid initializing an ctx more than once
++	teec_mutex_lock(&teec_mutex);
++	if (ctx->imp.is_initialized) {
++		teec_mutex_unlock(&teec_mutex);
++		return TEEC_ERROR_BAD_PARAMETERS;
++	}
++	teec_mutex_unlock(&teec_mutex);
++
+ 	for (n = 0; n < TEEC_MAX_DEV_SEQ; n++) {
+ 		uint32_t gen_caps = 0;
+ 
+ 		snprintf(devname, sizeof(devname), "/dev/tee%zu", n);
+ 		fd = teec_open_dev(devname, name, &gen_caps);
+ 		if (fd >= 0) {
++			// MOD: add mutex for multi-thread CA call on the same ctx
++			teec_mutex_lock(&teec_mutex);
+ 			ctx->imp.fd = fd;
+ 			ctx->imp.reg_mem = gen_caps & TEE_GEN_CAP_REG_MEM;
+ 			ctx->imp.memref_null = gen_caps & TEE_GEN_CAP_MEMREF_NULL;
++			ctx->imp.is_initialized = true;
++			// MOD: release mutex
++			teec_mutex_unlock(&teec_mutex);
+ 			return TEEC_SUCCESS;
+ 		}
+ 	}
+@@ -184,8 +202,17 @@ TEEC_Result TEEC_InitializeContext(const char *name, TEEC_Context *ctx)
+ 
+ void TEEC_FinalizeContext(TEEC_Context *ctx)
+ {
+-	if (ctx)
+-		close(ctx->imp.fd);
++	if (ctx) {
++		// MOD: add mutex for multi-thread CA call on the same ctx
++		teec_mutex_lock(&teec_mutex);
++		// MOD: avoid finalizing a ctx more than once
++		if (ctx->imp.is_initialized) {
++			close(ctx->imp.fd);
++			ctx->imp.is_initialized = false;
++		}
++		// MOD: release mutex
++		teec_mutex_unlock(&teec_mutex);
++	}
+ }
+ 
+ 
+@@ -332,8 +359,10 @@ static TEEC_Result teec_pre_process_operation(TEEC_Context *ctx,
+ 			struct tee_ioctl_param *params,
+ 			TEEC_SharedMemory *shms)
+ {
+-	TEEC_Result res = TEEC_ERROR_GENERIC;
++	TEEC_Result res = TEEC_SUCCESS;
+ 	size_t n = 0;
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 
+ 	memset(shms, 0, sizeof(TEEC_SharedMemory) *
+ 			TEEC_CONFIG_PAYLOAD_REF_COUNT);
+@@ -347,6 +376,12 @@ static TEEC_Result teec_pre_process_operation(TEEC_Context *ctx,
+ 		return TEEC_SUCCESS;
+ 	}
+ 
++	key = ADDR_TO_KEY(operation);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_mutex;
++	teec_mutex_lock(mutex);
++
+ 	for (n = 0; n < TEEC_CONFIG_PAYLOAD_REF_COUNT; n++) {
+ 		uint32_t param_type = 0;
+ 
+@@ -369,14 +404,14 @@ static TEEC_Result teec_pre_process_operation(TEEC_Context *ctx,
+ 				&operation->params[n].tmpref, params + n,
+ 				shms + n);
+ 			if (res != TEEC_SUCCESS)
+-				return res;
++				goto out;
+ 			break;
+ 		case TEEC_MEMREF_WHOLE:
+ 			res = teec_pre_process_whole(
+ 					&operation->params[n].memref,
+ 					params + n);
+ 			if (res != TEEC_SUCCESS)
+-				return res;
++				goto out;
+ 			break;
+ 		case TEEC_MEMREF_PARTIAL_INPUT:
+ 		case TEEC_MEMREF_PARTIAL_OUTPUT:
+@@ -384,14 +419,18 @@ static TEEC_Result teec_pre_process_operation(TEEC_Context *ctx,
+ 			res = teec_pre_process_partial(param_type,
+ 				&operation->params[n].memref, params + n);
+ 			if (res != TEEC_SUCCESS)
+-				return res;
++				goto out;
+ 			break;
+ 		default:
+-			return TEEC_ERROR_BAD_PARAMETERS;
++			res = TEEC_ERROR_BAD_PARAMETERS;
++			goto out;
+ 		}
+ 	}
+ 
+-	return TEEC_SUCCESS;
++out:
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
++	return res;
+ }
+ 
+ static void teec_post_process_tmpref(uint32_t param_type,
+@@ -454,10 +493,18 @@ static void teec_post_process_operation(TEEC_Operation *operation,
+ 			TEEC_SharedMemory *shms)
+ {
+ 	size_t n = 0;
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 
+ 	if (!operation)
+ 		return;
+ 
++	key = ADDR_TO_KEY(operation);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_mutex;
++	teec_mutex_lock(mutex);
++
+ 	for (n = 0; n < TEEC_CONFIG_PAYLOAD_REF_COUNT; n++) {
+ 		uint32_t param_type = 0;
+ 
+@@ -490,16 +537,26 @@ static void teec_post_process_operation(TEEC_Operation *operation,
+ 			break;
+ 		}
+ 	}
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ }
+ 
+ static void teec_free_temp_refs(TEEC_Operation *operation,
+ 			TEEC_SharedMemory *shms)
+ {
+ 	size_t n = 0;
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 
+ 	if (!operation)
+ 		return;
+ 
++	key = ADDR_TO_KEY(operation);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_mutex;
++	teec_mutex_lock(mutex);
++
+ 	for (n = 0; n < TEEC_CONFIG_PAYLOAD_REF_COUNT; n++) {
+ 		switch (TEEC_PARAM_TYPE_GET(operation->paramTypes, n)) {
+ 		case TEEC_MEMREF_TEMP_INPUT:
+@@ -511,6 +568,8 @@ static void teec_free_temp_refs(TEEC_Operation *operation,
+ 			break;
+ 		}
+ 	}
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ }
+ 
+ static TEEC_Result ioctl_errno_to_res(int err)
+@@ -596,6 +655,8 @@ TEEC_Result TEEC_OpenSession(TEEC_Context *ctx, TEEC_Session *session,
+ 			uint32_t connection_method, const void *connection_data,
+ 			TEEC_Operation *operation, uint32_t *ret_origin)
+ {
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 	struct tee_ioctl_open_session_arg *arg = NULL;
+ 	struct tee_ioctl_param *params = NULL;
+ 	TEEC_Result res = TEEC_ERROR_GENERIC;
+@@ -621,6 +682,15 @@ TEEC_Result TEEC_OpenSession(TEEC_Context *ctx, TEEC_Session *session,
+ 		goto out;
+ 	}
+ 
++	// MOD: add mutex for multi-thread CA call on the same session
++	key = ADDR_TO_KEY(session);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex) {
++		eorig = TEEC_ORIGIN_API;
++		res = TEEC_ERROR_BUSY;
++		goto out;
++	}
++
+ 	buf_data.buf_ptr = (uintptr_t)&buf;
+ 	buf_data.buf_len = sizeof(buf);
+ 
+@@ -648,13 +718,18 @@ TEEC_Result TEEC_OpenSession(TEEC_Context *ctx, TEEC_Session *session,
+ 	res = arg->ret;
+ 	eorig = arg->ret_origin;
+ 	if (res == TEEC_SUCCESS) {
++		// MOD: add mutex for multi-thread CA call on the same session
++		teec_mutex_lock(mutex);
+ 		session->imp.ctx = ctx;
+ 		session->imp.session_id = arg->session;
++		// MOD: release mutex
++		teec_mutex_unlock(mutex);
+ 	}
+ 	teec_post_process_operation(operation, params, shm);
+ 
+ out_free_temp_refs:
+ 	teec_free_temp_refs(operation, shm);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ out:
+ 	if (ret_origin)
+ 		*ret_origin = eorig;
+@@ -663,15 +738,31 @@ out:
+ 
+ void TEEC_CloseSession(TEEC_Session *session)
+ {
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 	struct tee_ioctl_close_session_arg arg;
++	int rc = 0;
+ 
+ 	memset(&arg, 0, sizeof(arg));
+ 
+ 	if (!session)
+ 		return;
+ 
++	// MOD: add mutex for multi-thread CA call on the same session
++	key = ADDR_TO_KEY(session);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_mutex;
++	teec_mutex_lock(mutex);
++
+ 	arg.session = session->imp.session_id;
+-	if (ioctl(session->imp.ctx->imp.fd, TEE_IOC_CLOSE_SESSION, &arg))
++	rc = ioctl(session->imp.ctx->imp.fd, TEE_IOC_CLOSE_SESSION, &arg);
++
++	// MOD: release mutex
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
++
++	if (rc)
+ 		EMSG("Failed to close session 0x%x", session->imp.session_id);
+ }
+ 
+@@ -747,6 +838,8 @@ out:
+ 
+ void TEEC_RequestCancellation(TEEC_Operation *operation)
+ {
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 	TEEC_Session *session = NULL;
+ 	struct tee_ioctl_cancel_arg arg;
+ 
+@@ -755,9 +848,17 @@ void TEEC_RequestCancellation(TEEC_Operation *operation)
+ 	if (!operation)
+ 		return;
+ 
+-	teec_mutex_lock(&teec_mutex);
++	// MOD: add mutex for multi-thread CA call on the same operation
++	key = ADDR_TO_KEY(operation);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_mutex;
++
++	teec_mutex_lock(mutex);
+ 	session = operation->imp.session;
+-	teec_mutex_unlock(&teec_mutex);
++	teec_mutex_unlock(mutex);
++
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 
+ 	if (!session)
+ 		return;
+@@ -774,6 +875,8 @@ TEEC_Result TEEC_RegisterSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 	TEEC_Result res = TEEC_SUCCESS;
+ 	int fd = 0;
+ 	size_t s = 0;
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 
+ 	if (!ctx || !shm)
+ 		return TEEC_ERROR_BAD_PARAMETERS;
+@@ -787,6 +890,14 @@ TEEC_Result TEEC_RegisterSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 	s = shm->size;
+ 	if (!s)
+ 		s = 8;
++
++	// MOD: add mutex for multi-thread CA call on the same shm
++	key = ADDR_TO_KEY(shm);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_shm_mutex;
++	teec_mutex_lock(mutex);
++
+ 	if (ctx->imp.reg_mem) {
+ 		fd = teec_shm_register(ctx->imp.fd, shm->buffer, s, &shm->imp.id);
+ 		if (fd >= 0) {
+@@ -806,8 +917,12 @@ TEEC_Result TEEC_RegisterSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 		 * register a shadow buffer before giving up.
+ 		 */
+ 		shm->imp.shadow_buffer = teec_paged_aligned_alloc(s);
+-		if (!shm->imp.shadow_buffer)
++		if (!shm->imp.shadow_buffer) {
++			// MOD: release mutex
++			teec_mutex_unlock(mutex);
++			TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 			return TEEC_ERROR_OUT_OF_MEMORY;
++		}
+ 		fd = teec_shm_register(ctx->imp.fd, shm->imp.shadow_buffer, s,
+ 				       &shm->imp.id);
+ 		if (fd >= 0) {
+@@ -822,17 +937,27 @@ TEEC_Result TEEC_RegisterSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 			res = TEEC_ERROR_GENERIC;
+ 		free(shm->imp.shadow_buffer);
+ 		shm->imp.shadow_buffer = NULL;
++		// MOD: release mutex
++		teec_mutex_unlock(mutex);
++		TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 		return res;
+ 	} else {
+ 		fd = teec_shm_alloc(ctx->imp.fd, s, &shm->imp.id);
+-		if (fd < 0)
++		if (fd < 0) {
++			// MOD: release mutex
++			teec_mutex_unlock(mutex);
++			TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 			return TEEC_ERROR_OUT_OF_MEMORY;
++		}
+ 
+ 		shm->imp.shadow_buffer = mmap(NULL, s, PROT_READ | PROT_WRITE,
+ 					  MAP_SHARED, fd, 0);
+ 		close(fd);
+ 		if (shm->imp.shadow_buffer == (void *)MAP_FAILED) {
+ 			shm->imp.id = -1;
++			// MOD: release mutex
++			teec_mutex_unlock(mutex);
++			TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 			return TEEC_ERROR_OUT_OF_MEMORY;
+ 		}
+ 		shm->imp.registered_fd = -1;
+@@ -841,6 +966,9 @@ TEEC_Result TEEC_RegisterSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 
+ out:
+ 	shm->imp.alloced_size = s;
++	// MOD: release mutex
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 	return TEEC_SUCCESS;
+ }
+ 
+@@ -848,6 +976,8 @@ TEEC_Result TEEC_RegisterSharedMemoryFileDescriptor(TEEC_Context *ctx,
+ 						    TEEC_SharedMemory *shm,
+ 						    int fd)
+ {
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
+ 	int rfd = 0;
+ 	struct tee_ioctl_shm_register_fd_data data;
+ 
+@@ -864,11 +994,20 @@ TEEC_Result TEEC_RegisterSharedMemoryFileDescriptor(TEEC_Context *ctx,
+ 	if (rfd < 0)
+ 		return TEEC_ERROR_BAD_PARAMETERS;
+ 
++	// MOD: add mutex for multi-thread CA call on the same shm
++	key = ADDR_TO_KEY(shm);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_shm_mutex;
++	teec_mutex_lock(mutex);
+ 	shm->buffer = NULL;
+ 	shm->imp.shadow_buffer = NULL;
+ 	shm->imp.registered_fd = rfd;
+ 	shm->imp.id = data.id;
+ 	shm->size = data.size;
++	// MOD: release mutex
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ 	return TEEC_SUCCESS;
+ }
+ 
+@@ -876,6 +1015,9 @@ TEEC_Result TEEC_AllocateSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ {
+ 	int fd = 0;
+ 	size_t s = 0;
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
++	TEEC_Result res = TEEC_SUCCESS;
+ 
+ 	if (!ctx || !shm)
+ 		return TEEC_ERROR_BAD_PARAMETERS;
+@@ -887,29 +1029,42 @@ TEEC_Result TEEC_AllocateSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 	if (!s)
+ 		s = 8;
+ 
++	// MOD: add mutex for multi-thread CA call on the same shm
++	key = ADDR_TO_KEY(shm);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_shm_mutex;
++	teec_mutex_lock(mutex);
++
+ 	if (ctx->imp.reg_mem) {
+ 		shm->buffer = teec_paged_aligned_alloc(s);
+-		if (!shm->buffer)
+-			return TEEC_ERROR_OUT_OF_MEMORY;
++		if (!shm->buffer) {
++			res = TEEC_ERROR_OUT_OF_MEMORY;
++			goto out;
++		}
+ 
+ 		fd = teec_shm_register(ctx->imp.fd, shm->buffer, s, &shm->imp.id);
+ 		if (fd < 0) {
+ 			free(shm->buffer);
+ 			shm->buffer = NULL;
+-			return TEEC_ERROR_OUT_OF_MEMORY;
++			res = TEEC_ERROR_OUT_OF_MEMORY;
++			goto out;
+ 		}
+ 		shm->imp.registered_fd = fd;
+ 	} else {
+ 		fd = teec_shm_alloc(ctx->imp.fd, s, &shm->imp.id);
+-		if (fd < 0)
+-			return TEEC_ERROR_OUT_OF_MEMORY;
++		if (fd < 0) {
++			res = TEEC_ERROR_OUT_OF_MEMORY;
++			goto out;
++		}
+ 
+ 		shm->buffer = mmap(NULL, s, PROT_READ | PROT_WRITE,
+ 				   MAP_SHARED, fd, 0);
+ 		close(fd);
+ 		if (shm->buffer == (void *)MAP_FAILED) {
+ 			shm->imp.id = -1;
+-			return TEEC_ERROR_OUT_OF_MEMORY;
++			res = TEEC_ERROR_OUT_OF_MEMORY;
++			goto out;
+ 		}
+ 		shm->imp.registered_fd = -1;
+ 	}
+@@ -917,14 +1072,30 @@ TEEC_Result TEEC_AllocateSharedMemory(TEEC_Context *ctx, TEEC_SharedMemory *shm)
+ 	shm->imp.shadow_buffer = NULL;
+ 	shm->imp.alloced_size = s;
+ 	shm->imp.flags = SHM_FLAG_BUFFER_ALLOCED;
+-	return TEEC_SUCCESS;
++
++	// MOD: release mutex
++out:
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
++
++	return res;
+ }
+ 
+ void TEEC_ReleaseSharedMemory(TEEC_SharedMemory *shm)
+ {
++	uint64_t key = 0;
++	pthread_mutex_t *mutex = NULL;
++
+ 	if (!shm || shm->imp.id == -1)
+ 		return;
+ 
++	// MOD: add mutex for multi-thread CA call on the same shm
++	key = ADDR_TO_KEY(shm);
++	mutex = TEEC_Mutex_Pool_Get(&teec_mutex_pool, key);
++	if (!mutex)
++		mutex = &teec_shm_mutex;
++	teec_mutex_lock(mutex);
++
+ 	if (shm->imp.shadow_buffer) {
+ 		if (shm->imp.registered_fd >= 0) {
+ 			if (shm->imp.flags &
+@@ -951,4 +1122,8 @@ void TEEC_ReleaseSharedMemory(TEEC_SharedMemory *shm)
+ 	shm->buffer = NULL;
+ 	shm->imp.registered_fd = -1;
+ 	shm->imp.flags = 0;
++
++	// MOD: release mutex
++	teec_mutex_unlock(mutex);
++	TEEC_Mutex_Pool_Unset(&teec_mutex_pool, key);
+ }
+diff --git a/libteec/src/teec_mutex_pool.c b/libteec/src/teec_mutex_pool.c
+new file mode 100644
+index 0000000..44cb994
+--- /dev/null
++++ b/libteec/src/teec_mutex_pool.c
+@@ -0,0 +1,73 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <teec_trace.h>
++
++#include <teec_mutex_pool.h>
++
++/*-------------------------------------------------------------------------*/
++/**
++ * TEEC_Mutex_Pool_Get - Get a mutex from a pool.
++ * 
++ * @param    pool    TEEC_Mutex_Pool object to search.
++ * @param    key     Key to look for in the pool.
++ * @return   a pointer to internally allocated mutex.
++ * 
++ * This function locates a key in a pool and returns a pointer to its
++ * value (mutex), or null pointer if no such key can be found in pool
++ * and the pool is used up.
++ */
++/*--------------------------------------------------------------------------*/
++pthread_mutex_t *TEEC_Mutex_Pool_Get(TEEC_Mutex_Pool *pool, uint64_t key)
++{
++    size_t i;
++    
++    if (key == POOL_INVALID_KEY)
++      return NULL;
++    
++    for (i = 0; i < TEEC_MUTEX_POOL_MAX_SIZE; i++) {
++        if (key == pool->key[i]) {
++          return &(pool->val[i]);
++        }
++    }
++
++    for (i = 0; i < TEEC_MUTEX_POOL_MAX_SIZE; i++) {
++        if (pool->key[i] == POOL_INVALID_KEY) {
++          pthread_mutex_lock(&pool->val[i]);
++          pool->key[i] = key;
++          pthread_mutex_unlock(&pool->val[i]);
++          return &(pool->val[i]);
++        }
++    }
++
++    return NULL;
++}
++
++/*-------------------------------------------------------------------------*/
++/**
++ * TEEC_Mutex_Pool_Unset - Remove a key in a pool.
++ * 
++ * @param    pool    TEEC_Mutex_Pool object to search.
++ * @param    key     Key to remove.
++ * 
++ * This function removes a key in a pool. Nothing is done if the
++ * key cannot be found.
++ */
++/*--------------------------------------------------------------------------*/
++void TEEC_Mutex_Pool_Unset(TEEC_Mutex_Pool *pool, uint64_t key)
++{
++    size_t i;
++
++    if (key == POOL_INVALID_KEY)
++      return;
++
++    for (i = 0; i < TEEC_MUTEX_POOL_MAX_SIZE; i++) {
++        if (key == pool->key[i]) {
++          pthread_mutex_lock(&pool->val[i]);
++          pool->key[i] = POOL_INVALID_KEY;
++          pthread_mutex_unlock(&pool->val[i]);
++          return;
++        }
++    }
++}
+\ No newline at end of file
