@@ -478,3 +478,15 @@ index 000000000..8534b6217
 +
 +#endif /* __PTA_HEAP_VULN_H */
 \ No newline at end of file
+diff --git a/mk/lib.mk b/mk/lib.mk
+index 315cae250..8d0ac6b5e 100644
+--- a/mk/lib.mk
++++ b/mk/lib.mk
+@@ -16,6 +16,7 @@
+ # updated cleanfiles and
+ # updated libfiles, libdirs, libnames and libdeps
+ 
++cppflags$(sm) += -DNDEBUG
+ 
+ subdirs = $(libdir)
+ include mk/subdir.mk

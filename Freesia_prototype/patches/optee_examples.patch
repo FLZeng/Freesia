@@ -101,7 +101,7 @@ index 0000000..03c134f
 +	$(CC) $(CFLAGS) -c $< -o $@
 diff --git a/heap_vuln/host/main.c b/heap_vuln/host/main.c
 new file mode 100644
-index 0000000..be3ecf2
+index 0000000..2677b3d
 --- /dev/null
 +++ b/heap_vuln/host/main.c
 @@ -0,0 +1,596 @@
@@ -585,7 +585,7 @@ index 0000000..be3ecf2
 +        goto fin;
 +
 +    uint64_t user1_addr = reg_pair_to_64(op.params[2].value.a, op.params[2].value.b);
-+    //uint64_t user2_addr = user1_addr - 0xC0;   // user mode
++    // uint64_t user2_addr = user1_addr - 0xC0;   // user mode
 +    uint64_t user2_addr = user1_addr - 0x220; // kernel mode
 +    uint64_t flink = user2_addr - 0x08;
 +    uint64_t blink = user1_addr + 0x01;
@@ -1160,13 +1160,6 @@ index 0000000..c71108a
 +#define TEE_BigIntSizeInU32(n) ((((n)+31)/32)+2)
 +
 +#endif /* TEE_API_DEFINES_H */
-diff --git a/heap_vuln/host/tee_api_defines.h.url b/heap_vuln/host/tee_api_defines.h.url
-new file mode 100644
-index 0000000..d9f32bb
---- /dev/null
-+++ b/heap_vuln/host/tee_api_defines.h.url
-@@ -0,0 +1 @@
-+https://raw.githubusercontent.com/OP-TEE/optee_os/3.4.0/lib/libutee/include/tee_api_defines.h
 diff --git a/heap_vuln/ta/Android.mk b/heap_vuln/ta/Android.mk
 new file mode 100644
 index 0000000..a1ff14a
@@ -1736,6 +1729,3623 @@ index 0000000..e6a906e
 +	USER_TA_PROP_TYPE_U32, &(const uint32_t){ 0x0010 } }
 +
 +#endif /* USER_TA_HEADER_DEFINES_H */
+diff --git a/perf_concurrency/Android.mk b/perf_concurrency/Android.mk
+new file mode 100644
+index 0000000..eb2f4a2
+--- /dev/null
++++ b/perf_concurrency/Android.mk
+@@ -0,0 +1,14 @@
++###################### optee-hello-world ######################
++LOCAL_PATH := $(call my-dir)
++
++include $(CLEAR_VARS)
++LOCAL_CFLAGS += -DANDROID_BUILD
++LOCAL_CFLAGS += -Wall
++
++LOCAL_SRC_FILES += host/main.c
++
++LOCAL_SHARED_LIBRARIES := libteec
++LOCAL_MODULE := optee_example_perf_concurrency
++LOCAL_VENDOR_MODULE := true
++LOCAL_MODULE_TAGS := optional
++include $(BUILD_EXECUTABLE)
+\ No newline at end of file
+diff --git a/perf_concurrency/CMakeLists.txt b/perf_concurrency/CMakeLists.txt
+new file mode 100644
+index 0000000..513fa0d
+--- /dev/null
++++ b/perf_concurrency/CMakeLists.txt
+@@ -0,0 +1,16 @@
++project (optee_example_perf_concurrency C)
++
++set (SRC
++	host/main.c
++	host/secure_storage.c
++)
++
++add_executable (${PROJECT_NAME} ${SRC})
++
++target_include_directories(${PROJECT_NAME}
++			   PRIVATE include
++				 PRIVATE host/include)
++
++target_link_libraries (${PROJECT_NAME} PRIVATE teec)
++
++install (TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/perf_concurrency/Makefile b/perf_concurrency/Makefile
+new file mode 100644
+index 0000000..b188683
+--- /dev/null
++++ b/perf_concurrency/Makefile
+@@ -0,0 +1,15 @@
++export V?=0
++
++# If _HOST or _TA specific compilers are not specified, then use CROSS_COMPILE
++HOST_CROSS_COMPILE ?= $(CROSS_COMPILE)
++TA_CROSS_COMPILE ?= $(CROSS_COMPILE)
++
++.PHONY: all
++all:
++	$(MAKE) -C host CROSS_COMPILE="$(HOST_CROSS_COMPILE)" --no-builtin-variables
++	$(MAKE) -C ta CROSS_COMPILE="$(TA_CROSS_COMPILE)" LDFLAGS=""
++
++.PHONY: clean
++clean:
++	$(MAKE) -C host clean
++	$(MAKE) -C ta clean
+diff --git a/perf_concurrency/host/Makefile b/perf_concurrency/host/Makefile
+new file mode 100644
+index 0000000..c40e87f
+--- /dev/null
++++ b/perf_concurrency/host/Makefile
+@@ -0,0 +1,28 @@
++CC      ?= $(CROSS_COMPILE)gcc
++LD      ?= $(CROSS_COMPILE)ld
++AR      ?= $(CROSS_COMPILE)ar
++NM      ?= $(CROSS_COMPILE)nm
++OBJCOPY ?= $(CROSS_COMPILE)objcopy
++OBJDUMP ?= $(CROSS_COMPILE)objdump
++READELF ?= $(CROSS_COMPILE)readelf
++
++OBJS = main.o
++
++CFLAGS += -Wall -I../ta/include -I./include
++CFLAGS += -I$(TEEC_EXPORT)/include
++LDADD += -lteec -L$(TEEC_EXPORT)/lib
++
++BINARY = optee_example_perf_concurrency
++
++.PHONY: all
++all: $(BINARY)
++
++$(BINARY): $(OBJS)
++	$(CC) $(LDFLAGS) -o $@ $< $(LDADD)
++
++.PHONY: clean
++clean:
++	rm -f $(OBJS) $(BINARY)
++
++%.o: %.c
++	$(CC) $(CFLAGS) -c $< -o $@
+\ No newline at end of file
+diff --git a/perf_concurrency/host/include/compiler.h b/perf_concurrency/host/include/compiler.h
+new file mode 100644
+index 0000000..47e8838
+--- /dev/null
++++ b/perf_concurrency/host/include/compiler.h
+@@ -0,0 +1,287 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ */
++
++#ifndef COMPILER_H
++#define COMPILER_H
++
++/*
++ * Macros that should be used instead of using __attribute__ directly to
++ * ease portability and make the code easier to read.
++ *
++ * Some of the defines below is known to sometimes cause conflicts when
++ * this file is included from xtest in normal world. It is assumed that
++ * the conflicting defines has the same meaning in that environment.
++ * Surrounding the troublesome defines with #ifndef should be enough.
++ */
++#define __deprecated	__attribute__((deprecated))
++#ifndef __packed
++#define __packed	__attribute__((packed))
++#endif
++#define __weak		__attribute__((weak))
++#define __alias(x)	__attribute__((alias(x)))
++#ifndef __noreturn
++#define __noreturn	__attribute__((__noreturn__))
++#endif
++#define __pure		__attribute__((pure))
++#define __aligned(x)	__attribute__((aligned(x)))
++#define __printf(a, b)	__attribute__((format(printf, a, b)))
++#define __noinline	__attribute__((noinline))
++#define __attr_const	__attribute__((__const__))
++#ifndef __unused
++#define __unused	__attribute__((unused))
++#endif
++#define __maybe_unused	__attribute__((unused))
++#ifndef __used
++#define __used		__attribute__((__used__))
++#endif
++#define __must_check	__attribute__((warn_unused_result))
++#define __cold		__attribute__((__cold__))
++#define __section(x)	__attribute__((section(x)))
++#define __data		__section(".data")
++#define __bss		__section(".bss")
++#ifdef __clang__
++#define __SECTION_FLAGS_RODATA
++#else
++/*
++ * Override sections flags/type generated by the C compiler to make sure they
++ * are: "a",%progbits (thus creating an allocatable, non-writeable, non-
++ * executable data section).
++ * The trailing COMMENT_CHAR comments out the flags generated by the compiler.
++ * This avoids a harmless warning with GCC.
++ */
++#if defined(__aarch64__) || defined(__arm__)
++#define COMMENT_CHAR "//"
++#else
++#define COMMENT_CHAR "#"
++#endif
++#define __SECTION_FLAGS_RODATA ",\"a\",%progbits " COMMENT_CHAR
++#endif
++#define __rodata	__section(".rodata" __SECTION_FLAGS_RODATA)
++#define __rodata_dummy	__section(".rodata.dummy" __SECTION_FLAGS_RODATA)
++#define __rodata_unpaged(x) \
++	__section(".rodata.__unpaged." x __SECTION_FLAGS_RODATA)
++#ifdef CFG_CORE_ASLR
++#define __relrodata_unpaged(x) __section(".data.rel.ro.__unpaged." x)
++#else
++#define __relrodata_unpaged(x) __rodata_unpaged(x)
++#endif
++#ifdef CFG_NS_VIRTUALIZATION
++#define __nex_bss		__section(".nex_bss")
++#define __nex_data		__section(".nex_data")
++#else  /* CFG_NS_VIRTUALIZATION */
++#define __nex_bss
++#define __nex_data
++#endif	/* CFG_NS_VIRTUALIZATION */
++#define __noprof	__attribute__((no_instrument_function))
++#define __nostackcheck	__attribute__((no_instrument_function))
++
++#define __compiler_bswap64(x)	__builtin_bswap64((x))
++#define __compiler_bswap32(x)	__builtin_bswap32((x))
++#define __compiler_bswap16(x)	__builtin_bswap16((x))
++
++#define __GCC_VERSION (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + \
++		       __GNUC_PATCHLEVEL__)
++
++#if __GCC_VERSION >= 50100 && !defined(__CHECKER__)
++#define __HAVE_BUILTIN_OVERFLOW 1
++#endif
++
++#if __GCC_VERSION >= 90100 && !defined(__CHECKER__)
++#define __HAVE_SINGLE_ARGUMENT_STATIC_ASSERT 1
++#endif
++
++#ifdef __HAVE_BUILTIN_OVERFLOW
++#define __compiler_add_overflow(a, b, res) \
++	__builtin_add_overflow((a), (b), (res))
++
++#define __compiler_sub_overflow(a, b, res) \
++	__builtin_sub_overflow((a), (b), (res))
++
++#define __compiler_mul_overflow(a, b, res) \
++	__builtin_mul_overflow((a), (b), (res))
++#else /*!__HAVE_BUILTIN_OVERFLOW*/
++
++/*
++ * Copied/inspired from https://www.fefe.de/intof.html
++ */
++
++#define __INTOF_ASSIGN(dest, src) (__extension__({ \
++	typeof(src) __intof_x = (src); \
++	typeof(dest) __intof_y = __intof_x; \
++	(((uintmax_t)__intof_x == (uintmax_t)__intof_y) && \
++	 ((__intof_x < 1) == (__intof_y < 1)) ? \
++		(void)((dest) = __intof_y) , 0 : 1); \
++}))
++
++#define __INTOF_ADD(c, a, b) (__extension__({ \
++	typeof(a) __intofa_a = (a); \
++	typeof(b) __intofa_b = (b); \
++	intmax_t __intofa_a_signed = __intofa_a; \
++	uintmax_t __intofa_a_unsigned = __intofa_a; \
++	intmax_t __intofa_b_signed = __intofa_b; \
++	uintmax_t __intofa_b_unsigned = __intofa_b; \
++	\
++	__intofa_b < 1 ? \
++		__intofa_a < 1 ? \
++			((INTMAX_MIN - __intofa_b_signed <= \
++			  __intofa_a_signed)) ? \
++				__INTOF_ASSIGN((c), __intofa_a_signed + \
++						    __intofa_b_signed) : 1 \
++		: \
++			((__intofa_a_unsigned >= (uintmax_t)-__intofa_b) ? \
++				__INTOF_ASSIGN((c), __intofa_a_unsigned + \
++						    __intofa_b_signed) \
++			: \
++				__INTOF_ASSIGN((c), \
++					(intmax_t)(__intofa_a_unsigned + \
++						   __intofa_b_signed))) \
++	: \
++		__intofa_a < 1 ? \
++			((__intofa_b_unsigned >= (uintmax_t)-__intofa_a) ? \
++				__INTOF_ASSIGN((c), __intofa_a_signed + \
++						    __intofa_b_unsigned) \
++			: \
++				__INTOF_ASSIGN((c), \
++					(intmax_t)(__intofa_a_signed + \
++						   __intofa_b_unsigned))) \
++		: \
++			((UINTMAX_MAX - __intofa_b_unsigned >= \
++			  __intofa_a_unsigned) ? \
++				__INTOF_ASSIGN((c), __intofa_a_unsigned + \
++						    __intofa_b_unsigned) : 1); \
++}))
++
++#define __INTOF_SUB(c, a, b) (__extension__({ \
++	typeof(a) __intofs_a = a; \
++	typeof(b) __intofs_b = b; \
++	intmax_t __intofs_a_signed = __intofs_a; \
++	uintmax_t __intofs_a_unsigned = __intofs_a; \
++	intmax_t __intofs_b_signed = __intofs_b; \
++	uintmax_t __intofs_b_unsigned = __intofs_b; \
++	\
++	__intofs_b < 1 ? \
++		__intofs_a < 1 ? \
++			((INTMAX_MAX + __intofs_b_signed >= \
++			  __intofs_a_signed) ? \
++				__INTOF_ASSIGN((c), __intofs_a_signed - \
++						    __intofs_b_signed) : 1) \
++		: \
++			(((uintmax_t)(UINTMAX_MAX + __intofs_b_signed) >= \
++			  __intofs_a_unsigned) ? \
++				__INTOF_ASSIGN((c), __intofs_a - \
++						    __intofs_b) : 1) \
++	: \
++		__intofs_a < 1 ? \
++			(((intmax_t)(INTMAX_MIN + __intofs_b) <= \
++			  __intofs_a_signed) ? \
++				__INTOF_ASSIGN((c), \
++					(intmax_t)(__intofs_a_signed - \
++						   __intofs_b_unsigned)) : 1) \
++		: \
++			((__intofs_b_unsigned <= __intofs_a_unsigned) ? \
++				__INTOF_ASSIGN((c), __intofs_a_unsigned - \
++						    __intofs_b_unsigned) \
++			: \
++				__INTOF_ASSIGN((c), \
++					(intmax_t)(__intofs_a_unsigned - \
++						   __intofs_b_unsigned))); \
++}))
++
++/*
++ * Dealing with detecting overflow in multiplication of integers.
++ *
++ * First step is to remove two corner cases with the minum signed integer
++ * which can't be represented as a positive integer + sign.
++ * Multiply with 0 or 1 can't overflow, no checking needed of the operation,
++ * only if it can be assigned to the result.
++ *
++ * After the corner cases are eliminated we convert the two factors to
++ * positive unsigned values, keeping track of the original in another
++ * variable which is used at the end to determine the sign of the product.
++ *
++ * The two terms (a and b) are divided into upper and lower half (x1 upper
++ * and x0 lower), so the product is:
++ * ((a1 << hshift) + a0) * ((b1 << hshift) + b0)
++ * which also is:
++ * ((a1 * b1) << (hshift * 2)) +				(T1)
++ * ((a1 * b0 + a0 * b1) << hshift) +				(T2)
++ * (a0 * b0)							(T3)
++ *
++ * From this we can tell and (a1 * b1) has to be 0 or we'll overflow, that
++ * is, at least one of a1 or b1 has to be 0. Once this has been checked the
++ * addition: ((a1 * b0) << hshift) + ((a0 * b1) << hshift)
++ * isn't an addition as one of the terms will be 0.
++ *
++ * Since each factor in: (a0 * b0)
++ * only uses half the capicity of the underlaying type it can't overflow
++ *
++ * The addition of T2 and T3 can overflow so we use __INTOF_ADD() to
++ * perform that addition. If the addition succeeds without overflow the
++ * result is assigned the required sign and checked for overflow again.
++ */
++
++#define __intof_mul_negate	((__intof_oa < 1) != (__intof_ob < 1))
++#define __intof_mul_hshift	(sizeof(uintmax_t) * 8 / 2)
++#define __intof_mul_hmask	(UINTMAX_MAX >> __intof_mul_hshift)
++#define __intof_mul_a0		((uintmax_t)(__intof_a) >> __intof_mul_hshift)
++#define __intof_mul_b0		((uintmax_t)(__intof_b) >> __intof_mul_hshift)
++#define __intof_mul_a1		((uintmax_t)(__intof_a) & __intof_mul_hmask)
++#define __intof_mul_b1		((uintmax_t)(__intof_b) & __intof_mul_hmask)
++#define __intof_mul_t		(__intof_mul_a1 * __intof_mul_b0 + \
++				 __intof_mul_a0 * __intof_mul_b1)
++
++#define __INTOF_MUL(c, a, b) (__extension__({ \
++	typeof(a) __intof_oa = (a); \
++	typeof(a) __intof_a = __intof_oa < 1 ? -__intof_oa : __intof_oa; \
++	typeof(b) __intof_ob = (b); \
++	typeof(b) __intof_b = __intof_ob < 1 ? -__intof_ob : __intof_ob; \
++	typeof(c) __intof_c; \
++	\
++	__intof_oa == 0 || __intof_ob == 0 || \
++	__intof_oa == 1 || __intof_ob == 1 ? \
++		__INTOF_ASSIGN((c), __intof_oa * __intof_ob) : \
++	(__intof_mul_a0 && __intof_mul_b0) || \
++	 __intof_mul_t > __intof_mul_hmask ?  1 : \
++	__INTOF_ADD((__intof_c), __intof_mul_t << __intof_mul_hshift, \
++				 __intof_mul_a1 * __intof_mul_b1) ? 1 : \
++	__intof_mul_negate ? __INTOF_ASSIGN((c), -__intof_c) : \
++			     __INTOF_ASSIGN((c), __intof_c); \
++}))
++
++#define __compiler_add_overflow(a, b, res) __INTOF_ADD(*(res), (a), (b))
++#define __compiler_sub_overflow(a, b, res) __INTOF_SUB(*(res), (a), (b))
++#define __compiler_mul_overflow(a, b, res) __INTOF_MUL(*(res), (a), (b))
++
++#endif /*!__HAVE_BUILTIN_OVERFLOW*/
++
++#define __compiler_compare_and_swap(p, oval, nval) \
++	__atomic_compare_exchange_n((p), (oval), (nval), true, \
++				    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED) \
++
++#define __compiler_atomic_load(p) __atomic_load_n((p), __ATOMIC_RELAXED)
++#define __compiler_atomic_store(p, val) \
++	__atomic_store_n((p), (val), __ATOMIC_RELAXED)
++
++#define barrier() asm volatile ("" : : : "memory")
++
++#ifndef __has_attribute
++#define __has_attribute(x) 0
++#endif
++
++#if __has_attribute(__fallthrough__)
++#define fallthrough __attribute__((__fallthrough__))
++#else
++#define fallthrough do {} while (0) /* fallthrough */
++#endif
++
++#ifndef __clang__
++#define __no_stackprot __attribute__((__optimize__ ("-fno-stack-protector")))
++#else
++#define __no_stackprot
++#endif
++
++#define __inhibit_loop_to_libcall \
++	__attribute__ ((__optimize__ ("-fno-tree-loop-distribute-patterns")))
++#endif /*COMPILER_H*/
+diff --git a/perf_concurrency/host/include/inttypes.h b/perf_concurrency/host/include/inttypes.h
+new file mode 100644
+index 0000000..5915a9d
+--- /dev/null
++++ b/perf_concurrency/host/include/inttypes.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ */
++#ifndef __INTTYPES_H
++#define __INTTYPES_H
++
++#include <stdint.h>
++
++#ifdef __ILP32__
++#define __PRI64_PREFIX	"ll"
++#endif
++#ifdef __LP64__
++#define __PRI64_PREFIX	"l"
++#endif
++#define __PRIPTR_PREFIX "l"
++
++#define PRId8		"d"
++#define PRId16		"d"
++#define PRId32		"d"
++#define PRId64		__PRI64_PREFIX "d"
++#define PRIdPTR		__PRIPTR_PREFIX "d"
++
++#define PRIi8		"i"
++#define PRIi16		"i"
++#define PRIi32		"i"
++#define PRIi64		__PRI64_PREFIX "i"
++#define PRIiPTR		__PRIPTR_PREFIX "i"
++
++#define PRIo8		"o"
++#define PRIo16		"o"
++#define PRIo32		"o"
++#define PRIo64		__PRI64_PREFIX "o"
++#define PRIoPTR		__PRIPTR_PREFIX "o"
++
++#define PRIu8		"u"
++#define PRIu16		"u"
++#define PRIu32		"u"
++#define PRIu64		__PRI64_PREFIX "u"
++#define PRIuPTR		__PRIPTR_PREFIX "u"
++
++#define PRIx8		"x"
++#define PRIx16		"x"
++#define PRIx32		"x"
++#define PRIx64		__PRI64_PREFIX "x"
++#define PRIxPTR		__PRIPTR_PREFIX "x"
++
++#define PRIX8		"X"
++#define PRIX16		"X"
++#define PRIX32		"X"
++#define PRIX64		__PRI64_PREFIX "X"
++#define PRIXPTR		__PRIPTR_PREFIX "X"
++
++#endif /*__INTTYPES_H*/
+diff --git a/perf_concurrency/host/include/perf_concurrency.h b/perf_concurrency/host/include/perf_concurrency.h
+new file mode 100644
+index 0000000..9226498
+--- /dev/null
++++ b/perf_concurrency/host/include/perf_concurrency.h
+@@ -0,0 +1,146 @@
++#ifndef PERF_CONCURRENCY_H
++#define PERF_CONCURRENCY_H
++
++#include <tee_client_api.h>
++
++#define TEEC_ERROR_CORRUPT_OBJECT 0xF0100001
++#define TEEC_ERROR_CORRUPT_OBJECT_2 0xF0100002
++#define TEEC_ERROR_STORAGE_NOT_AVAILABLE 0xF0100003
++#define TEEC_ERROR_STORAGE_NOT_AVAILABLE_2 0xF0100004
++
++#define TEEC_OPERATION_INITIALIZER \
++	{                                \
++	}
++
++struct test_1003_arg
++{
++	uint32_t test_type;
++	size_t repeat;
++	size_t max_before_lockers;
++	size_t max_during_lockers;
++	size_t before_lockers;
++	size_t during_lockers;
++	TEEC_Result res;
++	uint32_t error_orig;
++};
++
++struct test_1013_thread_arg
++{
++	const TEEC_UUID *uuid;
++	uint32_t cmd;
++	uint32_t repeat;
++	TEEC_SharedMemory *shm;
++	uint32_t error_orig;
++	TEEC_Result res;
++	uint32_t max_concurrency;
++	const uint8_t *in;
++	size_t in_len;
++	uint8_t *out;
++	size_t out_len;
++};
++
++struct test_6016_thread_arg
++{
++	uint32_t storage_id;
++	char file_name[8];
++	TEEC_Session session;
++	TEEC_Session *pSession;
++	uint8_t *data;
++	size_t data_len;
++	uint32_t error_orig;
++	TEEC_Result res;
++	size_t read_bytes;
++	size_t write_bytes;
++	uint64_t read_us;
++	uint64_t write_us;
++};
++
++static char *get_result_name(TEEC_Result res)
++{
++	switch (res)
++	{
++	case TEEC_SUCCESS:
++		return "TEEC_SUCCESS";
++	case TEEC_ERROR_CORRUPT_OBJECT:
++		return "TEEC_ERROR_CORRUPT_OBJECT";
++	case TEEC_ERROR_CORRUPT_OBJECT_2:
++		return "TEEC_ERROR_CORRUPT_OBJECT_2";
++	case TEEC_ERROR_STORAGE_NOT_AVAILABLE:
++		return "TEEC_ERROR_STORAGE_NOT_AVAILABLE";
++	case TEEC_ERROR_STORAGE_NOT_AVAILABLE_2:
++		return "TEEC_ERROR_STORAGE_NOT_AVAILABLE_2";
++	case TEEC_ERROR_GENERIC:
++		return "TEEC_ERROR_GENERIC";
++	case TEEC_ERROR_ACCESS_DENIED:
++		return "TEEC_ERROR_ACCESS_DENIED";
++	case TEEC_ERROR_CANCEL:
++		return "TEEC_ERROR_CANCEL";
++	case TEEC_ERROR_ACCESS_CONFLICT:
++		return "TEEC_ERROR_ACCESS_CONFLICT";
++	case TEEC_ERROR_EXCESS_DATA:
++		return "TEEC_ERROR_EXCESS_DATA";
++	case TEEC_ERROR_BAD_FORMAT:
++		return "TEEC_ERROR_BAD_FORMAT";
++	case TEEC_ERROR_BAD_PARAMETERS:
++		return "TEEC_ERROR_BAD_PARAMETERS";
++	case TEEC_ERROR_BAD_STATE:
++		return "TEEC_ERROR_BAD_STATE";
++	case TEEC_ERROR_ITEM_NOT_FOUND:
++		return "TEEC_ERROR_ITEM_NOT_FOUND";
++	case TEEC_ERROR_NOT_IMPLEMENTED:
++		return "TEEC_ERROR_NOT_IMPLEMENTED";
++	case TEEC_ERROR_NOT_SUPPORTED:
++		return "TEEC_ERROR_NOT_SUPPORTED";
++	case TEEC_ERROR_NO_DATA:
++		return "TEEC_ERROR_NO_DATA";
++	case TEEC_ERROR_OUT_OF_MEMORY:
++		return "TEEC_ERROR_OUT_OF_MEMORY";
++	case TEEC_ERROR_BUSY:
++		return "TEEC_ERROR_BUSY";
++	case TEEC_ERROR_COMMUNICATION:
++		return "TEEC_ERROR_COMMUNICATION";
++	case TEEC_ERROR_SECURITY:
++		return "TEEC_ERROR_SECURITY";
++	case TEEC_ERROR_SHORT_BUFFER:
++		return "TEEC_ERROR_SHORT_BUFFER";
++	case TEEC_ERROR_EXTERNAL_CANCEL:
++		return "TEEC_ERROR_EXTERNAL_CANCEL";
++	case TEE_ERROR_OVERFLOW:
++		return "TEE_ERROR_OVERFLOW";
++	case TEEC_ERROR_TARGET_DEAD:
++		return "TEEC_ERROR_TARGET_DEAD";
++	case TEEC_ERROR_STORAGE_NO_SPACE:
++		return "TEEC_ERROR_STORAGE_NO_SPACE";
++	case TEE_ERROR_MAC_INVALID:
++		return "TEE_ERROR_MAC_INVALID";
++	case TEE_ERROR_SIGNATURE_INVALID:
++		return "TEE_ERROR_SIGNATURE_INVALID";
++	case TEE_ERROR_TIME_NOT_SET:
++		return "TEE_ERROR_TIME_NOT_SET";
++	case TEE_ERROR_TIME_NEEDS_RESET:
++		return "TEE_ERROR_TIME_NEEDS_RESET";
++	default:
++		return "Unknown";
++	}
++}
++
++static char *get_origin_name(uint32_t origin)
++{
++	switch (origin)
++	{
++	case TEEC_ORIGIN_API:
++		return "TEEC_ORIGIN_API";
++	case TEEC_ORIGIN_COMMS:
++		return "TEEC_ORIGIN_COMMS";
++	case TEEC_ORIGIN_TEE:
++		return "TEEC_ORIGIN_TEE";
++	case TEEC_ORIGIN_TRUSTED_APP:
++		return "TEEC_ORIGIN_TRUSTED_APP";
++	default:
++		return "Unknown";
++	}
++}
++
++void xtest_tee_test_6016();
++
++#endif /*PERF_CONCURRENCY_H*/
+\ No newline at end of file
+diff --git a/perf_concurrency/host/include/pta_attestation.h b/perf_concurrency/host/include/pta_attestation.h
+new file mode 100644
+index 0000000..76a1d3a
+--- /dev/null
++++ b/perf_concurrency/host/include/pta_attestation.h
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (C) 2021, Huawei Technologies Co., Ltd
++ */
++
++/*
++ * Provide remote attestation services
++ */
++
++#ifndef __PTA_ATTESTATION_H
++#define __PTA_ATTESTATION_H
++
++#define PTA_ATTESTATION_UUID { 0x39800861, 0x182a, 0x4720, \
++		{ 0x9b, 0x67, 0x2b, 0xcd, 0x62, 0x2b, 0xc0, 0xb5 } }
++
++/*
++ * Get the RSA public key that should be used to verify the values returned by
++ * other commands.
++ *
++ * [out]    memref[0]        Public key exponent in big endian order
++ * [out]    memref[1]        Modulus in big endian order
++ * [out]    value[2]         Signature algorithm used by other commands.
++ *                           Currently always
++ *                           TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256.
++ *
++ * Return codes:
++ * TEE_SUCCESS
++ * TEE_ERROR_GENERIC - Internal error
++ * TEE_ERROR_SHORT_BUFFER - One or both buffers are too small, required size
++ *                          is provided in memref[i].size
++ */
++#define PTA_ATTESTATION_GET_PUBKEY 0x0
++
++/*
++ * Return the digest found in the header of a Trusted Application binary or a
++ * Trusted Shared library
++ *
++ * [in]     memref[0]        UUID of the TA or shared library
++ * [in]     memref[1]        Nonce (random non-NULL, non-empty buffer of any
++ *                           size to prevent replay attacks)
++ * [out]    memref[2]        Output buffer. Receives the signed digest.
++ *                           - The first 32 bytes are the digest itself (from
++ *                             the TA signed header: struct shdr::hash)
++ *                           - The following bytes are a signature:
++ *                               SIG(SHA256(Nonce | digest))
++ *                           - The algorithm is
++ *                             TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256 with a salt
++ *                             length of 32.
++ *                           - The key pair is generated internally and stored
++ *                             in secure storage. The public key can be
++ *                             retrieved with command PTA_ATTESTATION_GET_PUBKEY
++ *                             (typically during device provisioning).
++ *                           Given that the sigature length is equal to the
++ *                           RSA modulus size in bytes, the output buffer size
++ *                           should be at least (digest size + modulus size)
++ *                           bytes. For example, for a 32-byte SHA256 digest and
++ *                           2048 bit key (256 bytes) the minimum buffer size is
++ *                           288 bytes.
++ *
++ * Return codes:
++ * TEE_SUCCESS
++ * TEE_ERROR_BAD_PARAMETERS - Incorrect input param
++ * TEE_ERROR_SHORT_BUFFER - Output buffer size less than required
++ */
++#define PTA_ATTESTATION_GET_TA_SHDR_DIGEST 0x1
++
++/*
++ * Return a signed hash for a running user space TA, which must be the caller
++ * of this PTA. It is a runtime measurement of the memory pages that contain
++ * immutable data (code and read-only data).
++ *
++ * [in]     memref[0]        Nonce
++ * [out]    memref[1]        SHA256 hash of the TA memory followed by a
++ *                           signature. See PTA_ATTESTATION_GET_TA_HDR_DIGEST
++ *                           for a description of the signature.
++ *
++ * Return codes:
++ * TEE_SUCCESS
++ * TEE_ERROR_ACCESS_DENIED - Caller is not a user space TA
++ * TEE_ERROR_BAD_PARAMETERS - Incorrect input param
++ * TEE_ERROR_SHORT_BUFFER - Output buffer size less than required
++ */
++#define PTA_ATTESTATION_HASH_TA_MEMORY 0x2
++
++/*
++ * Return a signed hash of the TEE OS (kernel) memory. It is a runtime
++ * measurement of the memory pages that contain immutable data (code and
++ * read-only data).
++ *
++ * [in]     memref[0]        Nonce
++ * [out]    memref[1]        SHA256 hash of the TEE memory followed by a
++ *                           signature. See PTA_ATTESTATION_GET_TA_HDR_DIGEST
++ *                           for a description of the signature.
++ *
++ * Return codes:
++ * TEE_SUCCESS
++ * TEE_ERROR_BAD_PARAMETERS - Incorrect input param
++ * TEE_ERROR_SHORT_BUFFER - Output buffer size less than required
++ */
++#define PTA_ATTESTATION_HASH_TEE_MEMORY 0x3
++
++#endif /* __PTA_ATTESTATION_H */
+diff --git a/perf_concurrency/host/include/pta_invoke_tests.h b/perf_concurrency/host/include/pta_invoke_tests.h
+new file mode 100644
+index 0000000..79cd989
+--- /dev/null
++++ b/perf_concurrency/host/include/pta_invoke_tests.h
+@@ -0,0 +1,112 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2017, Linaro Limited
++ */
++
++#ifndef __PTA_INVOKE_TESTS_H
++#define __PTA_INVOKE_TESTS_H
++
++#define PTA_INVOKE_TESTS_UUID \
++		{ 0xd96a5b40, 0xc3e5, 0x21e3, \
++			{ 0x87, 0x94, 0x10, 0x02, 0xa5, 0xd5, 0xc6, 0x1b } }
++
++/* Trace some hello string. Parameters are not used/checked. */
++#define PTA_INVOKE_TESTS_CMD_TRACE		0
++
++/*
++ * Types of parameter drives the test sequences:
++ * - test on value parameters
++ * - test on SHM memory reference parameters
++ * - test on SDP memory reference parameters
++ */
++#define PTA_INVOKE_TESTS_CMD_PARAMS		1
++
++/* Run some core internal tests. Parameters are not used/checked. */
++#define PTA_INVOKE_TESTS_CMD_SELF_TESTS		2
++
++/*
++ * Secure data path: check that PTA can copy data from non-secure shared memory
++ * to SDP secure memory
++ *
++ * [in]     memref[0]        source (non-secure shared memory)
++ * [out]    memref[1]        destination (SDP secure memory)
++ */
++#define PTA_INVOKE_TESTS_CMD_COPY_NSEC_TO_SEC	3
++
++/*
++ * Secure data path: check that PTA can read data from SDP secure memory and
++ * write it back. Data are processed so that client check the expected
++ * read/write sequence succeed.
++ *
++ * [in/out]     memref[0]        SDP secure buffer to read from and write to
++ */
++#define PTA_INVOKE_TESTS_CMD_READ_MODIFY_SEC	4
++
++/*
++ * Secure data path: check that PTA can copy data from SDP secure memory to
++ * non-secure shared memory
++ *
++ * [in]     memref[0]        source (SDP secure memory)
++ * [out]    memref[1]        destination (non-secure shared memory)
++ */
++#define PTA_INVOKE_TESTS_CMD_COPY_SEC_TO_NSEC	5
++
++/*
++ * Tests FS hash-tree corner cases in error handling
++ */
++#define PTA_INVOKE_TESTS_CMD_FS_HTREE		6
++
++/*
++ * Tests mutex
++ *
++ * [in]  value[0].a	Test function PTA_MUTEX_TEST_*
++ * [in]  value[0].b	delay number
++ * [out] value[1].a	before lock concurency
++ * [out] value[1].b	during lock concurency
++ */
++#define PTA_MUTEX_TEST_WRITER			0
++#define PTA_MUTEX_TEST_READER			1
++#define PTA_INVOKE_TESTS_CMD_MUTEX		7
++
++/*
++ * Tests lock dependency checking algorithm
++ */
++#define PTA_INVOKE_TESTS_CMD_LOCKDEP		8
++
++/*
++ * These values should match the ones in
++ * optee_test/ta/aes_perf/include/ta_aes_perf.h
++ */
++#define PTA_INVOKE_TESTS_AES_ECB		0
++#define PTA_INVOKE_TESTS_AES_CBC		1
++#define PTA_INVOKE_TESTS_AES_CTR		2
++#define PTA_INVOKE_TESTS_AES_XTS		3
++#define PTA_INVOKE_TESTS_AES_GCM		4
++
++/*
++ * AES performance tests
++ *
++ * [in]     value[0].a	Top 16 bits Decrypt, low 16 bits key size in bits
++ * [in]     value[0].b	AES mode, one of
++ *			PTA_INVOKE_TESTS_AES_{ECB_NOPAD,CBC_NOPAD,CTR,XTS,GCM}
++ * [in]     value[1].a	repetition count
++ * [in]     value[1].b	unit size
++ * [in]     memref[2]	In buffer
++ * [in]     memref[3]	Out buffer
++ */
++#define PTA_INVOKE_TEST_CMD_AES_PERF		9
++
++/*
++ * NULL memory reference parameter
++ *
++ * [in/out] memref[0]	NULL memory reference of size zero
++ */
++#define PTA_INVOKE_TESTS_CMD_MEMREF_NULL	10
++
++/*
++ * Retrieve results of the dt_driver framework internal test
++ */
++#define PTA_INVOKE_TESTS_CMD_DT_DRIVER_TESTS	11
++
++#endif /*__PTA_INVOKE_TESTS_H*/
++
+diff --git a/perf_concurrency/host/include/pta_secstor_ta_mgmt.h b/perf_concurrency/host/include/pta_secstor_ta_mgmt.h
+new file mode 100644
+index 0000000..47c74b0
+--- /dev/null
++++ b/perf_concurrency/host/include/pta_secstor_ta_mgmt.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2017, Linaro Limited
++ */
++
++#ifndef __PTA_SECSTOR_TA_MGMT_H
++#define __PTA_SECSTOR_TA_MGMT_H
++
++/*
++ * Bootstrap (install initial) Trusted Application or Secure Domain into
++ * secure storage from a signed binary.
++ *
++ * [in]		memref[0]: signed binary
++ */
++#define PTA_SECSTOR_TA_MGMT_BOOTSTRAP	0
++
++#define PTA_SECSTOR_TA_MGMT_UUID { 0x6e256cba, 0xfc4d, 0x4941, { \
++				   0xad, 0x09, 0x2c, 0xa1, 0x86, 0x03, 0x42, \
++				   0xdd } }
++
++#endif /*__PTA_SECSTOR_TA_MGMT_H*/
+diff --git a/perf_concurrency/host/include/stdint.h b/perf_concurrency/host/include/stdint.h
+new file mode 100644
+index 0000000..687fe7e
+--- /dev/null
++++ b/perf_concurrency/host/include/stdint.h
+@@ -0,0 +1,208 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ */
++
++#include <limits.h>
++
++/*
++ * This file provides what C99 standard requires in
++ * 7.18 interger types <stdint.h>
++ */
++
++#ifndef __STDINT_H
++#define __STDINT_H
++
++/*
++ * If compiler supplies neither __ILP32__ or __LP64__, try to figure it out
++ * here.
++ */
++#if !defined(__ILP32__) && !defined(__LP64__)
++#if defined(__SIZEOF_INT__) && defined(__SIZEOF_POINTER__) && \
++	defined(__SIZEOF_LONG__)
++#if __SIZEOF_INT__ == 4 && __SIZEOF_POINTER__ == 4 && __SIZEOF_LONG__ == 4
++#define __ILP32__ 1
++#endif
++#if __SIZEOF_INT__ == 4 && __SIZEOF_POINTER__ == 8 && __SIZEOF_LONG__ == 8
++#define __LP64__ 1
++#endif
++#endif
++#endif /* !defined(__ILP32__) && !defined(__LP64__) */
++
++#if !defined(__ILP32__) && !defined(__LP64__)
++#error Neither __ILP32__ nor __LP64__ is defined
++#endif
++
++#ifndef __ASSEMBLER__
++
++/* 7.18.1.1 Exact-width interger types */
++#ifndef __int8_t_defined
++# define __int8_t_defined
++typedef signed char             int8_t;
++typedef short int               int16_t;
++typedef int                     int32_t;
++#ifdef __ILP32__
++__extension__
++typedef long long int           int64_t;
++#endif /*__ILP32__*/
++#ifdef __LP64__
++typedef long int		int64_t;
++#endif /*__LP64__*/
++#endif
++
++/* Unsigned.  */
++typedef unsigned char           uint8_t;
++typedef unsigned short int      uint16_t;
++#ifndef __uint32_t_defined
++typedef unsigned int            uint32_t;
++# define __uint32_t_defined
++#endif
++#ifdef __ILP32__
++__extension__
++typedef unsigned long long int  uint64_t;
++#endif /*__ILP32__*/
++#ifdef __LP64__
++typedef unsigned long int	uint64_t;
++#endif /*__LP64__*/
++
++/* 7.18.1.2 Minimum-width integer types */
++typedef int8_t int_least8_t;
++typedef int16_t int_least16_t;
++typedef int32_t int_least32_t;
++typedef int64_t int_least64_t;
++typedef uint8_t uint_least8_t;
++typedef uint16_t uint_least16_t;
++typedef uint32_t uint_least32_t;
++typedef uint64_t uint_least64_t;
++
++/* 7.18.1.3 Fastest minimum-width integer types */
++typedef int8_t int_fast8_t;
++typedef int16_t int_fast16_t;
++typedef int32_t int_fast32_t;
++typedef int64_t int_fast64_t;
++typedef uint8_t uint_fast8_t;
++typedef uint16_t uint_fast16_t;
++typedef uint32_t uint_fast32_t;
++typedef uint64_t uint_fast64_t;
++
++/* 7.18.1.4 Integer types capable of holding object pointers */
++typedef long intptr_t;
++typedef unsigned long uintptr_t;
++
++typedef int64_t intmax_t;
++typedef uint64_t uintmax_t;
++
++#endif /*__ASSEMBLER__*/
++
++/*
++ * 7.18.2 Limits of specified-width integer types
++ */
++
++/* 7.18.2.1 Limits of exact-width interger types */
++
++#define INT8_MIN    (-0x7f-1)
++#define INT16_MIN   (-0x7fff-1)
++#define INT32_MIN   (-0x7fffffff-1)
++#define INT64_MIN   (-0x7fffffffffffffffL-1)
++
++#define INT8_MAX    0x7f
++#define INT16_MAX   0x7fff
++#define INT32_MAX   0x7fffffff
++#define INT64_MAX   0x7fffffffffffffffL
++
++#define UINT8_MAX    0xff
++#define UINT16_MAX   0xffff
++#define UINT32_MAX   0xffffffffU
++#define UINT64_MAX   0xffffffffffffffffUL
++
++/* 7.18.2.2 Limits of minimum-width integer types */
++
++#define INT_LEAST8_MIN		INT8_MIN
++#define INT_LEAST16_MIN		INT16_MIN
++#define INT_LEAST32_MIN		INT32_MIN
++#define INT_LEAST64_MIN		INT64_MIN
++
++#define INT_LEAST8_MAX		INT8_MAX
++#define INT_LEAST16_MAX		INT16_MAX
++#define INT_LEAST32_MAX		INT32_MAX
++#define INT_LEAST64_MAX		INT64_MAX
++
++#define UINT_LEAST8_MAX		UINT8_MAX
++#define UINT_LEAST16_MAX	UINT16_MAX
++#define UINT_LEAST32_MAX	UINT32_MAX
++#define UINT_LEAST64_MAX	UINT64_MAX
++
++/* 7.18.2.3 Limits of fastest minimum-width integer types */
++
++#define INT_FAST8_MIN		INT8_MIN
++#define INT_FAST16_MIN		INT16_MIN
++#define INT_FAST32_MIN		INT32_MIN
++#define INT_FAST64_MIN		INT64_MIN
++
++#define INT_FAST8_MAX		INT8_MAX
++#define INT_FAST16_MAX		INT16_MAX
++#define INT_FAST32_MAX		INT32_MAX
++#define INT_FAST64_MAX		INT64_MAX
++
++#define UINT_FAST8_MAX		UINT8_MAX
++#define UINT_FAST16_MAX		UINT16_MAX
++#define UINT_FAST32_MAX		UINT32_MAX
++#define UINT_FAST64_MAX		UINT64_MAX
++
++/* 7.18.2.4 Limits of integer types capable of holding object pointers */
++
++#define INTPTR_MIN  LONG_MIN
++#define INTPTR_MAX  LONG_MAX
++#define UINTPTR_MAX ULONG_MAX
++
++/* 7.18.2.5  Limits of greatest-width integer types */
++#define INTMAX_MAX  INT64_MAX
++#define INTMAX_MIN  INT64_MIN
++#define UINTMAX_MAX UINT64_MAX
++
++/* 7.18.3  Limits of other integer types */
++#define SIZE_MAX	ULONG_MAX
++
++/*
++ * 7.18.4 Macros for integer constants
++ */
++
++#ifdef __ASSEMBLER__
++#define U(v)		v
++#define UL(v)		v
++#define ULL(v)		v
++#define L(v)		v
++#define LL(v)		v
++#else
++#define U(v)		v ## U
++#define UL(v)		v ## UL
++#define ULL(v)		v ## ULL
++#define L(v)		v ## L
++#define LL(v)		v ## LL
++#endif
++
++/* 7.18.4.1 Macros for minimum-width integer constants */
++
++#define INT8_C(v)	v
++#define UINT8_C(v)	v
++#define INT16_C(v)	v
++#define UINT16_C(v)	v
++#define INT32_C(v)	v
++#define UINT32_C(v)	U(v)
++#ifdef __ILP32__
++#define INT64_C(v)	LL(v)
++#define UINT64_C(v)	ULL(v)
++#endif
++#ifdef __LP64__
++#define INT64_C(v)	L(v)
++#define UINT64_C(v)	UL(v)
++#endif
++
++#define UINTPTR_C(v)	UL(v)
++
++/* 7.18.4.2 Macros for greatest-width integer constants */
++
++#define INTMAX_C(v)	INT64_C(v)
++#define UINTMAX_C(v)	UINT64_C(v)
++
++#endif /* __STDINT_H */
+diff --git a/perf_concurrency/host/include/ta_concurrent.h b/perf_concurrency/host/include/ta_concurrent.h
+new file mode 100644
+index 0000000..5c60a70
+--- /dev/null
++++ b/perf_concurrency/host/include/ta_concurrent.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2015, Linaro Limited
++ * All rights reserved.
++ */
++
++#ifndef TA_CONCURRENT_H
++#define TA_CONCURRENT_H
++
++#include <tee_client_api.h>
++
++/* This UUID is generated with the ITU-T UUID generator at
++   http://www.itu.int/ITU-T/asn1/uuid.html */
++#define TA_CONCURRENT_UUID { 0xe13010e0, 0x2ae1, 0x11e5, \
++	{ 0x89, 0x6a, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }
++
++struct ta_concurrent_shm {
++	uint32_t active_count;
++};
++
++/*
++ * Busy loops and updates max concurrency.  params[0].memref should contain
++ * a struct ta_concurent_shm which can be used to tell how many instances
++ * of this function is running in parallel.
++ *
++ * in/out	params[0].memref
++ * in/out	params[1].value.a	(input) number times to calcule the hash
++ * in/out	params[1].value.b	(output) max concurency
++ */
++
++#define TA_CONCURRENT_CMD_BUSY_LOOP	0
++
++/*
++ * Calculates a sha-256 hash over param[2].memref and stores the result in
++ * params[3].memref. params[0].memref should contain a struct
++ * ta_concurent_shm which can be used to tell how many instances of this
++ * function is running in parallel.
++ *
++ * in/out	params[0].memref
++ * in/out	params[1].value.a	(input) number times to calcule the hash
++ * in/out	params[1].value.b	(output) max concurency
++ * in		params[2].memref
++ * out		params[3].memref
++ */
++#define TA_CONCURRENT_CMD_SHA256	1
++
++#endif /*TA_OS_TEST_H */
+diff --git a/perf_concurrency/host/include/ta_concurrent_large.h b/perf_concurrency/host/include/ta_concurrent_large.h
+new file mode 100644
+index 0000000..5ba35c5
+--- /dev/null
++++ b/perf_concurrency/host/include/ta_concurrent_large.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2015, Linaro Limited
++ * All rights reserved.
++ */
++
++#ifndef TA_CONCURRENT_LARGE_H
++#define TA_CONCURRENT_LARGE_H
++
++#include "ta_concurrent.h"
++
++/* 5ce0c432-0ab0-40e5-a056-782ca0e6aba2 */
++#define TA_CONCURRENT_LARGE_UUID { 0x5ce0c432, 0x0ab0, 0x40e5, \
++	{ 0xa0,0x56, 0x78, 0x2c, 0xa0, 0xe6, 0xab, 0xa2 } }
++
++#endif /*TA_CONCURRENT_LARGE_H */
+diff --git a/perf_concurrency/host/include/ta_storage.h b/perf_concurrency/host/include/ta_storage.h
+new file mode 100644
+index 0000000..f494f5c
+--- /dev/null
++++ b/perf_concurrency/host/include/ta_storage.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ * All rights reserved.
++ */
++
++#include <stdint.h>
++
++#ifndef __TA_STORAGE_H
++#define __TA_STORAGE_H
++
++#define TA_STORAGE_UUID { 0xb689f2a7, 0x8adf, 0x477a, \
++	{ 0x9f, 0x99, 0x32, 0xe9, 0x0c, 0x0a, 0xd0, 0xa2 } }
++#define TA_STORAGE2_UUID { 0x731e279e, 0xaafb, 0x4575, \
++	{ 0xa7, 0x71, 0x38, 0xca, 0xa6, 0xf0, 0xcc, 0xa6 } }
++
++struct ta_storage_obj_info {
++	uint32_t object_type;
++	uint32_t object_size;
++	uint32_t max_object_size;
++	uint32_t object_usage;
++	uint32_t data_size;
++	uint32_t data_position;
++	uint32_t handle_flags;
++};
++
++#define TA_STORAGE_CMD_OPEN			0
++#define TA_STORAGE_CMD_CLOSE			1
++#define TA_STORAGE_CMD_READ			2
++#define TA_STORAGE_CMD_WRITE			3
++#define TA_STORAGE_CMD_CREATE			4
++#define TA_STORAGE_CMD_SEEK			5
++#define TA_STORAGE_CMD_UNLINK			6
++#define TA_STORAGE_CMD_RENAME			7
++#define TA_STORAGE_CMD_TRUNC			8
++#define TA_STORAGE_CMD_ALLOC_ENUM		9
++#define TA_STORAGE_CMD_FREE_ENUM		10
++#define TA_STORAGE_CMD_RESET_ENUM		11
++#define TA_STORAGE_CMD_START_ENUM		12
++#define TA_STORAGE_CMD_NEXT_ENUM		13
++#define TA_STORAGE_CMD_CREATE_OVERWRITE		14
++#define TA_STORAGE_CMD_KEY_IN_PERSISTENT	15
++#define TA_STORAGE_CMD_LOOP			16
++#define TA_STORAGE_CMD_RESTRICT_USAGE		17
++#define TA_STORAGE_CMD_ALLOC_OBJ		18
++#define TA_STORAGE_CMD_FREE_OBJ			19
++#define TA_STORAGE_CMD_RESET_OBJ		20
++#define TA_STORAGE_CMD_GET_OBJ_INFO		21
++#define TA_STORAGE_CMD_OPEN_ID_IN_SHM		22
++#define TA_STORAGE_CMD_CREATE_ID_IN_SHM		23
++#define TA_STORAGE_CMD_CREATEOVER_ID_IN_SHM	24
++#define TA_STORAGE_CMD_RENAME_ID_IN_SHM		25
++#define TA_STORAGE_CMD_CLEAR_STORAGE		26
++
++#endif /*__TA_STORAGE_H*/
+diff --git a/perf_concurrency/host/include/tee_api_compat.h b/perf_concurrency/host/include/tee_api_compat.h
+new file mode 100644
+index 0000000..166f1a7
+--- /dev/null
++++ b/perf_concurrency/host/include/tee_api_compat.h
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2022, Linaro Limited
++ */
++
++#ifndef __TEE_API_COMPAT_H
++#define __TEE_API_COMPAT_H
++
++/*
++ * This function will be called from TA_OpenSessionEntryPoint() in
++ * user_ta_header.c (if compiled with __OPTEE_CORE_API_COMPAT_1_1), the
++ * compatibility entry function is passed as a function pointer in @fp.
++ * This is needed since libutee is never compiled with
++ * __OPTEE_CORE_API_COMPAT_1_1, but we still need a way to call the
++ * compatibility function __GP11_TA_InvokeCommandEntryPoint(), but only
++ * when __OPTEE_CORE_API_COMPAT_1_1 is defined.
++ */
++TEE_Result __ta_open_sess(uint32_t pt, TEE_Param params[TEE_NUM_PARAMS],
++			  void **sess_ctx,
++			  TEE_Result (*fp)(uint32_t,
++					   __GP11_TEE_Param [TEE_NUM_PARAMS],
++					   void **));
++
++/*
++ * Same as for __ta_open_sess_func(), except that @fp now is a pointer to
++ * __GP11_TA_InvokeCommandEntryPoint().
++ */
++TEE_Result __ta_invoke_cmd(void *sess_ctx, uint32_t cmd_id, uint32_t pt,
++			   TEE_Param params[TEE_NUM_PARAMS],
++			   TEE_Result (*fp)(void *, uint32_t, uint32_t,
++					    __GP11_TEE_Param [TEE_NUM_PARAMS]));
++
++#if __OPTEE_CORE_API_COMPAT_1_1
++/* Types */
++#define TEE_Attribute __GP11_TEE_Attribute
++#define TEE_ObjectInfo __GP11_TEE_ObjectInfo
++#define TEE_Param __GP11_TEE_Param
++
++/* Functions */
++#define TA_InvokeCommandEntryPoint __GP11_TA_InvokeCommandEntryPoint
++#define TA_OpenSessionEntryPoint __GP11_TA_OpenSessionEntryPoint
++#define TEE_AEDecryptFinal __GP11_TEE_AEDecryptFinal
++#define TEE_AEEncryptFinal __GP11_TEE_AEEncryptFinal
++#define TEE_AEInit __GP11_TEE_AEInit
++#define TEE_AEUpdateAAD __GP11_TEE_AEUpdateAAD
++#define TEE_AEUpdate __GP11_TEE_AEUpdate
++#define TEE_AllocateTransientObject __GP11_TEE_AllocateTransientObject
++#define TEE_AsymmetricDecrypt __GP11_TEE_AsymmetricDecrypt
++#define TEE_AsymmetricEncrypt __GP11_TEE_AsymmetricEncrypt
++#define TEE_AsymmetricSignDigest __GP11_TEE_AsymmetricSignDigest
++#define TEE_AsymmetricVerifyDigest __GP11_TEE_AsymmetricVerifyDigest
++#define TEE_BigIntConvertFromOctetString __GP11_TEE_BigIntConvertFromOctetString
++#define TEE_BigIntConvertToOctetString __GP11_TEE_BigIntConvertToOctetString
++#define TEE_BigIntFMMContextSizeInU32 __GP11_TEE_BigIntFMMContextSizeInU32
++#define TEE_BigIntFMMSizeInU32 __GP11_TEE_BigIntFMMSizeInU32
++#define TEE_BigIntInitFMMContext __GP11_TEE_BigIntInitFMMContext
++#define TEE_BigIntInitFMM __GP11_TEE_BigIntInitFMM
++#define TEE_BigIntShiftRight __GP11_TEE_BigIntShiftRight
++#define TEE_CheckMemoryAccessRights __GP11_TEE_CheckMemoryAccessRights
++#define TEE_CipherDoFinal __GP11_TEE_CipherDoFinal
++#define TEE_CipherInit __GP11_TEE_CipherInit
++#define TEE_CipherUpdate __GP11_TEE_CipherUpdate
++#define TEE_CreatePersistentObject __GP11_TEE_CreatePersistentObject
++#define TEE_DeriveKey __GP11_TEE_DeriveKey
++#define TEE_DigestDoFinal __GP11_TEE_DigestDoFinal
++#define TEE_DigestUpdate __GP11_TEE_DigestUpdate
++#define TEE_FreeOperation __GP11_TEE_FreeOperation
++#define TEE_GenerateKey __GP11_TEE_GenerateKey
++#define TEE_GenerateRandom __GP11_TEE_GenerateRandom
++#define TEE_GetNextPersistentObject __GP11_TEE_GetNextPersistentObject
++#define TEE_GetObjectBufferAttribute __GP11_TEE_GetObjectBufferAttribute
++#define TEE_GetObjectInfo1 __GP11_TEE_GetObjectInfo1
++#define TEE_GetObjectInfo __GP11_TEE_GetObjectInfo
++#define TEE_GetOperationInfoMultiple __GP11_TEE_GetOperationInfoMultiple
++#define TEE_GetPropertyAsBinaryBlock __GP11_TEE_GetPropertyAsBinaryBlock
++#define TEE_GetPropertyAsString __GP11_TEE_GetPropertyAsString
++#define TEE_GetPropertyName __GP11_TEE_GetPropertyName
++#define TEE_InitRefAttribute __GP11_TEE_InitRefAttribute
++#define TEE_InitValueAttribute __GP11_TEE_InitValueAttribute
++#define TEE_InvokeTACommand __GP11_TEE_InvokeTACommand
++#define TEE_MACCompareFinal __GP11_TEE_MACCompareFinal
++#define TEE_MACComputeFinal __GP11_TEE_MACComputeFinal
++#define TEE_MACInit __GP11_TEE_MACInit
++#define TEE_MACUpdate __GP11_TEE_MACUpdate
++#define TEE_Malloc __GP11_TEE_Malloc
++#define TEE_MemCompare __GP11_TEE_MemCompare
++#define TEE_MemFill __GP11_TEE_MemFill
++#define TEE_MemMove __GP11_TEE_MemMove
++#define TEE_OpenPersistentObject __GP11_TEE_OpenPersistentObject
++#define TEE_OpenTASession __GP11_TEE_OpenTASession
++#define TEE_PopulateTransientObject __GP11_TEE_PopulateTransientObject
++#define TEE_ReadObjectData __GP11_TEE_ReadObjectData
++#define TEE_Realloc __GP11_TEE_Realloc
++#define TEE_RenamePersistentObject __GP11_TEE_RenamePersistentObject
++#define TEE_SeekObjectData __GP11_TEE_SeekObjectData
++#define TEE_SetOperationKey2 __GP11_TEE_SetOperationKey2
++#define TEE_SetOperationKey __GP11_TEE_SetOperationKey
++#define TEE_TruncateObjectData __GP11_TEE_TruncateObjectData
++#define TEE_WriteObjectData __GP11_TEE_WriteObjectData
++#endif
++
++#endif /*__TEE_API_COMPAT_H*/
+diff --git a/perf_concurrency/host/include/tee_api_defines.h b/perf_concurrency/host/include/tee_api_defines.h
+new file mode 100644
+index 0000000..9e0979c
+--- /dev/null
++++ b/perf_concurrency/host/include/tee_api_defines.h
+@@ -0,0 +1,697 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ * Copyright (c) 2022, Linaro Limited
++ */
++
++/* Based on GP TEE Internal Core API Specification Version 1.3.1 */
++
++#ifndef TEE_API_DEFINES_H
++#define TEE_API_DEFINES_H
++
++#define TEE_CORE_API_MAJOR_VERSION		1U
++#define TEE_CORE_API_MINOR_VERSION		3U
++#define TEE_CORE_API_MAINTENANCE_VERSION	1U
++#define TEE_CORE_API_VERSION \
++			((TEE_CORE_API_MAJOR_VERSION << 24) | \
++			 (TEE_CORE_API_MINOR_VERSION << 16) | \
++			 (TEE_CORE_API_MAINTENANCE_VERSION << 8))
++#define TEE_CORE_API_1_3_1
++
++/*
++ * Below follows the GP defined way of letting a TA define that it wants an
++ * API compatible with version 1.1 or the latest. An alternative approach
++ * is to set __OPTEE_CORE_API_COMPAT_1_1, but that's an OP-TEE extension.
++ *
++ * The GP specs (>= 1.2) requires that only APIs defined in the indicated
++ * version SHALL be made available when using this mechanism. However, that
++ * is far beyond what ordinary standards requires as they permit
++ * extensions. With this, in OP-TEE, extensions and new API that doesn't
++ * interfere with the selected version of the standard will be permitted.
++ */
++#if defined(TEE_CORE_API_REQUIRED_MAINTENANCE_VERSION) && \
++	!defined(TEE_CORE_API_REQUIRED_MINOR_VERSION)
++#error "Required TEE_CORE_API_REQUIRED_MINOR_VERSION undefined"
++#endif
++#if defined(TEE_CORE_API_REQUIRED_MINOR_VERSION) && \
++	!defined(TEE_CORE_API_REQUIRED_MAJOR_VERSION)
++#error "Required TEE_CORE_API_REQUIRED_MAJOR_VERSION undefined"
++#endif
++
++#if defined(TEE_CORE_API_REQUIRED_MAJOR_VERSION)
++#if TEE_CORE_API_REQUIRED_MAJOR_VERSION != 1 && \
++	TEE_CORE_API_REQUIRED_MAJOR_VERSION != 0
++#error "Required major version not supported"
++#endif
++#ifdef TEE_CORE_API_REQUIRED_MINOR_VERSION
++#if TEE_CORE_API_REQUIRED_MINOR_VERSION == 1
++#define __OPTEE_CORE_API_COMPAT_1_1 1
++#else
++#error "Required minor version not supported"
++#endif
++#if defined(TEE_CORE_API_REQUIRED_MAINTENANCE_VERSION) && \
++	TEE_CORE_API_REQUIRED_MAINTENANCE_VERSION != 0
++#error "Required maintenance version not supported"
++#endif
++#endif
++#endif
++
++/*
++ * For backwards compatibility with v1.1 as provided by up to OP-TEE
++ * version 3.19.0, define __OPTEE_CORE_API_COMPAT_1_1 to 1.
++ *
++ * Some versions of the GP specs have introduced backwards incompatible
++ * changes. For example the v1.0:
++ *
++ * TEE_Result TEE_DigestDoFinal(TEE_OperationHandle operation,
++ *				const void *chunk, uint32_t chunkLen,
++ *				void *hash, uint32_t *hashLen);
++ *
++ * Was changed in v1.1.1 to this:
++ *
++ * TEE_Result TEE_DigestDoFinal(TEE_OperationHandle operation,
++ *				 const void *chunk, size_t chunkLen,
++ *				 void *hash, size_t *hashLen);
++ *
++ * Note the type change for "hashLen", a source of problem especially on
++ * platforms where size_t is a 64-bit unsigned integer.
++ *
++ * As a way of allowing older TAs to be compiled with a newer version of
++ * the API we can turn off or hide different incompatible changes. New
++ * features which are not interfering with older versions of the API are
++ * not disabled. So by enabling __OPTEE_CORE_API_COMPAT_1_1 will not result
++ * in pure 1.1 API, it will be a hybrid API that should work with most TAs
++ * not yet updated to the new API.
++ *
++ * Backwards compatibility is provided by duplicating all functions that
++ * has changed since v1.1. The original function is given a "__GP11_"
++ * prefix and preprocessor macros are used to let a legacy TA use the old
++ * function instead. The same principle applies to defined types.
++ */
++#ifndef __OPTEE_CORE_API_COMPAT_1_1
++#define __OPTEE_CORE_API_COMPAT_1_1	0
++#endif
++
++#define TEE_HANDLE_NULL                   0
++
++#define TEE_TIMEOUT_INFINITE              0xFFFFFFFF
++
++/* API Error Codes */
++#define TEE_SUCCESS                       0x00000000
++#define TEE_ERROR_CORRUPT_OBJECT          0xF0100001
++#define TEE_ERROR_CORRUPT_OBJECT_2        0xF0100002
++#define TEE_ERROR_STORAGE_NOT_AVAILABLE   0xF0100003
++#define TEE_ERROR_STORAGE_NOT_AVAILABLE_2 0xF0100004
++#define TEE_ERROR_UNSUPPORTED_VERSION     0xF0100005
++#define TEE_ERROR_CIPHERTEXT_INVALID      0xF0100006
++#define TEE_ERROR_GENERIC                 0xFFFF0000
++#define TEE_ERROR_ACCESS_DENIED           0xFFFF0001
++#define TEE_ERROR_CANCEL                  0xFFFF0002
++#define TEE_ERROR_ACCESS_CONFLICT         0xFFFF0003
++#define TEE_ERROR_EXCESS_DATA             0xFFFF0004
++#define TEE_ERROR_BAD_FORMAT              0xFFFF0005
++#define TEE_ERROR_BAD_PARAMETERS          0xFFFF0006
++#define TEE_ERROR_BAD_STATE               0xFFFF0007
++#define TEE_ERROR_ITEM_NOT_FOUND          0xFFFF0008
++#define TEE_ERROR_NOT_IMPLEMENTED         0xFFFF0009
++#define TEE_ERROR_NOT_SUPPORTED           0xFFFF000A
++#define TEE_ERROR_NO_DATA                 0xFFFF000B
++#define TEE_ERROR_OUT_OF_MEMORY           0xFFFF000C
++#define TEE_ERROR_BUSY                    0xFFFF000D
++#define TEE_ERROR_COMMUNICATION           0xFFFF000E
++#define TEE_ERROR_SECURITY                0xFFFF000F
++#define TEE_ERROR_SHORT_BUFFER            0xFFFF0010
++#define TEE_ERROR_EXTERNAL_CANCEL         0xFFFF0011
++#define TEE_ERROR_TIMEOUT                 0xFFFF3001
++#define TEE_ERROR_OVERFLOW                0xFFFF300F
++#define TEE_ERROR_TARGET_DEAD             0xFFFF3024
++#define TEE_ERROR_STORAGE_NO_SPACE        0xFFFF3041
++#define TEE_ERROR_MAC_INVALID             0xFFFF3071
++#define TEE_ERROR_SIGNATURE_INVALID       0xFFFF3072
++#define TEE_ERROR_TIME_NOT_SET            0xFFFF5000
++#define TEE_ERROR_TIME_NEEDS_RESET        0xFFFF5001
++
++/* Parameter Type Constants */
++#define TEE_PARAM_TYPE_NONE             0
++#define TEE_PARAM_TYPE_VALUE_INPUT      1
++#define TEE_PARAM_TYPE_VALUE_OUTPUT     2
++#define TEE_PARAM_TYPE_VALUE_INOUT      3
++#define TEE_PARAM_TYPE_MEMREF_INPUT     5
++#define TEE_PARAM_TYPE_MEMREF_OUTPUT    6
++#define TEE_PARAM_TYPE_MEMREF_INOUT     7
++
++/* Login Type Constants */
++#define TEE_LOGIN_PUBLIC                0x00000000
++#define TEE_LOGIN_USER                  0x00000001
++#define TEE_LOGIN_GROUP                 0x00000002
++#define TEE_LOGIN_APPLICATION           0x00000004
++#define TEE_LOGIN_APPLICATION_USER      0x00000005
++#define TEE_LOGIN_APPLICATION_GROUP     0x00000006
++#define TEE_LOGIN_TRUSTED_APP           0xF0000000
++
++/* Origin Code Constants */
++#define TEE_ORIGIN_API                  0x00000001
++#define TEE_ORIGIN_COMMS                0x00000002
++#define TEE_ORIGIN_TEE                  0x00000003
++#define TEE_ORIGIN_TRUSTED_APP          0x00000004
++
++/* Property Sets pseudo handles */
++#define TEE_PROPSET_TEE_IMPLEMENTATION  (TEE_PropSetHandle)0xFFFFFFFD
++#define TEE_PROPSET_CURRENT_CLIENT      (TEE_PropSetHandle)0xFFFFFFFE
++#define TEE_PROPSET_CURRENT_TA          (TEE_PropSetHandle)0xFFFFFFFF
++
++/* Memory Access Rights Constants */
++#define TEE_MEMORY_ACCESS_READ             0x00000001
++#define TEE_MEMORY_ACCESS_WRITE            0x00000002
++#define TEE_MEMORY_ACCESS_ANY_OWNER        0x00000004
++
++/* Memory Management Constant */
++#define TEE_MALLOC_FILL_ZERO               0x00000000
++#define TEE_MALLOC_NO_FILL                 0x00000001
++#define TEE_MALLOC_NO_SHARE                0x00000002
++
++/* TEE_Whence Constants */
++#define TEE_DATA_SEEK_SET		   0x00000000
++#define TEE_DATA_SEEK_CUR		   0x00000001
++#define TEE_DATA_SEEK_END		   0x00000002
++#define TEE_WHENCE_ILLEGAL_VALUE	   0x7FFFFFFF
++
++/* TEE_OperationMode Values */
++#define TEE_MODE_ENCRYPT		   0x00000000
++#define TEE_MODE_DECRYPT		   0x00000001
++#define TEE_MODE_SIGN			   0x00000002
++#define TEE_MODE_VERIFY			   0x00000003
++#define TEE_MODE_MAC			   0x00000004
++#define TEE_MODE_DIGEST			   0x00000005
++#define TEE_MODE_DERIVE			   0x00000006
++#define TEE_MODE_ILLEGAL_VALUE		   0x7FFFFFFF
++
++/* Other constants */
++#define TEE_STORAGE_PRIVATE                0x00000001
++
++#define TEE_DATA_FLAG_ACCESS_READ          0x00000001
++#define TEE_DATA_FLAG_ACCESS_WRITE         0x00000002
++#define TEE_DATA_FLAG_ACCESS_WRITE_META    0x00000004
++#define TEE_DATA_FLAG_SHARE_READ           0x00000010
++#define TEE_DATA_FLAG_SHARE_WRITE          0x00000020
++#define TEE_DATA_FLAG_OVERWRITE            0x00000400
++#define TEE_DATA_MAX_POSITION              0xFFFFFFFF
++#define TEE_OBJECT_ID_MAX_LEN              64
++#define TEE_USAGE_EXTRACTABLE              0x00000001
++#define TEE_USAGE_ENCRYPT                  0x00000002
++#define TEE_USAGE_DECRYPT                  0x00000004
++#define TEE_USAGE_MAC                      0x00000008
++#define TEE_USAGE_SIGN                     0x00000010
++#define TEE_USAGE_VERIFY                   0x00000020
++#define TEE_USAGE_DERIVE                   0x00000040
++#define TEE_HANDLE_FLAG_PERSISTENT         0x00010000
++#define TEE_HANDLE_FLAG_INITIALIZED        0x00020000
++#define TEE_HANDLE_FLAG_KEY_SET            0x00040000
++#define TEE_HANDLE_FLAG_EXPECT_TWO_KEYS    0x00080000
++#define TEE_HANDLE_FLAG_EXTRACTING         0x00100000
++#define TEE_OPERATION_CIPHER               1
++#define TEE_OPERATION_MAC                  3
++#define TEE_OPERATION_AE                   4
++#define TEE_OPERATION_DIGEST               5
++#define TEE_OPERATION_ASYMMETRIC_CIPHER    6
++#define TEE_OPERATION_ASYMMETRIC_SIGNATURE 7
++#define TEE_OPERATION_KEY_DERIVATION       8
++#define TEE_OPERATION_STATE_INITIAL        0x00000000
++#define TEE_OPERATION_STATE_ACTIVE         0x00000001
++#define TEE_OPERATION_STATE_EXTRACTING     0x00000002
++
++/* Algorithm Identifiers */
++#define TEE_ALG_AES_ECB_NOPAD                   0x10000010
++#define TEE_ALG_AES_CBC_NOPAD                   0x10000110
++#define TEE_ALG_AES_CTR                         0x10000210
++#define TEE_ALG_AES_CTS                         0x10000310
++#define TEE_ALG_AES_XTS                         0x10000410
++#define TEE_ALG_AES_CBC_MAC_NOPAD               0x30000110
++#define TEE_ALG_AES_CBC_MAC_PKCS5               0x30000510
++#define TEE_ALG_AES_CMAC                        0x30000610
++#define TEE_ALG_AES_CCM                         0x40000710
++#define TEE_ALG_AES_GCM                         0x40000810
++#define TEE_ALG_DES_ECB_NOPAD                   0x10000011
++#define TEE_ALG_DES_CBC_NOPAD                   0x10000111
++#define TEE_ALG_DES_CBC_MAC_NOPAD               0x30000111
++#define TEE_ALG_DES_CBC_MAC_PKCS5               0x30000511
++#define TEE_ALG_DES3_ECB_NOPAD                  0x10000013
++#define TEE_ALG_DES3_CBC_NOPAD                  0x10000113
++#define TEE_ALG_DES3_CBC_MAC_NOPAD              0x30000113
++#define TEE_ALG_DES3_CBC_MAC_PKCS5              0x30000513
++#define TEE_ALG_SM4_ECB_NOPAD                   0x10000014
++#define TEE_ALG_SM4_CBC_NOPAD                   0x10000114
++#define TEE_ALG_SM4_CTR                         0x10000214
++#define TEE_ALG_RSASSA_PKCS1_V1_5_MD5           0x70001830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA1          0x70002830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA224        0x70003830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA256        0x70004830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA384        0x70005830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA512        0x70006830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_MD5SHA1       0x7000F830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA3_224      0x70008830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA3_256      0x70009830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA3_384      0x7000A830
++#define TEE_ALG_RSASSA_PKCS1_V1_5_SHA3_512      0x7000B830
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA1      0x70212930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA224    0x70313930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256    0x70414930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA384    0x70515930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA512    0x70616930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA3_224  0x70818930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA3_256  0x70919930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA3_384  0x70A1A930
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA3_512  0x70B1B930
++#define TEE_ALG_RSAES_PKCS1_V1_5                0x60000130
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA1      0x60210230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA224    0x60310230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA256    0x60410230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA384    0x60510230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA512    0x60610230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA3_224  0x60810230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA3_256  0x60910230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA3_384  0x60A10230
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA3_512  0x60B10230
++#define TEE_ALG_RSA_NOPAD                       0x60000030
++#define TEE_ALG_DSA_SHA1                        0x70002131
++#define TEE_ALG_DSA_SHA224                      0x70003131
++#define TEE_ALG_DSA_SHA256                      0x70004131
++#define TEE_ALG_DSA_SHA3_224                    0x70008131
++#define TEE_ALG_DSA_SHA3_256                    0x70009131
++#define TEE_ALG_DSA_SHA3_384                    0x7000A131
++#define TEE_ALG_DSA_SHA3_512                    0x7000B131
++#define TEE_ALG_SM2_DSA_SM3                     0x70006045
++#define TEE_ALG_DH_DERIVE_SHARED_SECRET         0x80000032
++#define TEE_ALG_SM2_KEP                         0x60000045
++#define TEE_ALG_MD5                             0x50000001
++#define TEE_ALG_SHA1                            0x50000002
++#define TEE_ALG_SHA224                          0x50000003
++#define TEE_ALG_SHA256                          0x50000004
++#define TEE_ALG_SHA384                          0x50000005
++#define TEE_ALG_SHA512                          0x50000006
++#define TEE_ALG_SHA3_224                        0x50000008
++#define	TEE_ALG_SHA3_256                        0x50000009
++#define	TEE_ALG_SHA3_384                        0x5000000A
++#define	TEE_ALG_SHA3_512                        0x5000000B
++#define TEE_ALG_MD5SHA1                         0x5000000F
++#define TEE_ALG_HMAC_MD5                        0x30000001
++#define TEE_ALG_HMAC_SHA1                       0x30000002
++#define TEE_ALG_HMAC_SHA224                     0x30000003
++#define TEE_ALG_HMAC_SHA256                     0x30000004
++#define TEE_ALG_HMAC_SHA384                     0x30000005
++#define TEE_ALG_HMAC_SHA512                     0x30000006
++#define TEE_ALG_HMAC_SM3                        0x30000007
++#define TEE_ALG_HMAC_SHA3_224                   0x30000008
++#define TEE_ALG_HMAC_SHA3_256                   0x30000009
++#define TEE_ALG_HMAC_SHA3_384                   0x3000000A
++#define TEE_ALG_HMAC_SHA3_512                   0x3000000B
++
++/*
++ * These are used in the OP-TEE ABI, due to an inconsistency in the v1.1
++ * specification the wrong values we assumed and now we're stuck with those.
++ *
++ * In GP Internal Core API v1.1
++ *     "Table 6-12:  Structure of Algorithm Identifier"
++ *     indicates ECDSA have the algorithm "0x41" and ECDH "0x42"
++ * whereas
++ *     "Table 6-11:  List of Algorithm Identifiers" defines
++ *     TEE_ALG_ECDSA_P192 as 0x70001042
++ *
++ * We chose to define __OPTEE_TEE_ALG_ECDSA_P192 as 0x70001041 and so on
++ * to conform to table 6-12.
++ */
++#define __OPTEE_ALG_ECDSA_P192			0x70001041
++#define __OPTEE_ALG_ECDSA_P224			0x70002041
++#define __OPTEE_ALG_ECDSA_P256			0x70003041
++#define __OPTEE_ALG_ECDSA_P384			0x70004041
++#define __OPTEE_ALG_ECDSA_P521			0x70005041
++#define __OPTEE_ALG_ECDH_P192			0x80001042
++#define __OPTEE_ALG_ECDH_P224			0x80002042
++#define __OPTEE_ALG_ECDH_P256			0x80003042
++#define __OPTEE_ALG_ECDH_P384			0x80004042
++#define __OPTEE_ALG_ECDH_P521			0x80005042
++
++/* TEE_ALG_ECDSA_P* and TEE_ALG_ECDH_P* are deprecated */
++#define TEE_ALG_ECDSA_P192			TEE_ALG_ECDSA_SHA1
++#define TEE_ALG_ECDSA_P224			TEE_ALG_ECDSA_SHA224
++#define TEE_ALG_ECDSA_P256			TEE_ALG_ECDSA_SHA256
++#define TEE_ALG_ECDSA_P384			TEE_ALG_ECDSA_SHA384
++#define TEE_ALG_ECDSA_P521			TEE_ALG_ECDSA_SHA512
++#define TEE_ALG_ECDH_P192		TEE_ALG_ECDH_DERIVE_SHARED_SECRET
++#define TEE_ALG_ECDH_P224		TEE_ALG_ECDH_DERIVE_SHARED_SECRET
++#define TEE_ALG_ECDH_P256		TEE_ALG_ECDH_DERIVE_SHARED_SECRET
++#define TEE_ALG_ECDH_P384		TEE_ALG_ECDH_DERIVE_SHARED_SECRET
++#define TEE_ALG_ECDH_P521		TEE_ALG_ECDH_DERIVE_SHARED_SECRET
++
++#define TEE_ALG_ECDH_DERIVE_SHARED_SECRET	0x80000042
++#define TEE_ALG_ECDSA_SHA1			0x70001042
++#define TEE_ALG_ECDSA_SHA224			0x70002042
++#define TEE_ALG_ECDSA_SHA256			0x70003042
++#define TEE_ALG_ECDSA_SHA384			0x70004042
++#define TEE_ALG_ECDSA_SHA512			0x70005042
++#define TEE_ALG_ECDSA_SHA3_224                  0x70006042
++#define TEE_ALG_ECDSA_SHA3_256                  0x70007042
++#define TEE_ALG_ECDSA_SHA3_384                  0x70008042
++#define TEE_ALG_ECDSA_SHA3_512                  0x70009042
++
++#define TEE_ALG_ED25519                         0x70006043
++#define TEE_ALG_ED448                           0x70006044
++#define TEE_ALG_SM2_PKE                         0x80000046
++#define TEE_ALG_HKDF                            0x80000047
++#define TEE_ALG_SM3                             0x50000007
++#define TEE_ALG_X25519                          0x80000044
++#define TEE_ALG_X448                            0x80000045
++#define TEE_ALG_SM4_ECB_PKCS5                   0x10000015
++#define TEE_ALG_SM4_CBC_PKCS5                   0x10000115
++#define TEE_ALG_ILLEGAL_VALUE                   0xEFFFFFFF
++
++#define TEE_ALG_SHA3_224                        0x50000008
++#define TEE_ALG_SHA3_256                        0x50000009
++#define TEE_ALG_SHA3_384                        0x5000000A
++#define TEE_ALG_SHA3_512                        0x5000000B
++#define TEE_ALG_SHAKE128                        0x50000101
++#define TEE_ALG_SHAKE256                        0x50000102
++
++/* Object Types */
++
++#define TEE_TYPE_AES                        0xA0000010
++#define TEE_TYPE_DES                        0xA0000011
++#define TEE_TYPE_DES3                       0xA0000013
++#define TEE_TYPE_SM4                        0xA0000014
++#define TEE_TYPE_HMAC_MD5                   0xA0000001
++#define TEE_TYPE_HMAC_SHA1                  0xA0000002
++#define TEE_TYPE_HMAC_SHA224                0xA0000003
++#define TEE_TYPE_HMAC_SHA256                0xA0000004
++#define TEE_TYPE_HMAC_SHA384                0xA0000005
++#define TEE_TYPE_HMAC_SHA512                0xA0000006
++#define TEE_TYPE_HMAC_SM3                   0xA0000007
++#define TEE_TYPE_HMAC_SHA3_224              0xA0000008
++#define TEE_TYPE_HMAC_SHA3_256              0xA0000009
++#define TEE_TYPE_HMAC_SHA3_384              0xA000000A
++#define TEE_TYPE_HMAC_SHA3_512              0xA000000B
++#define TEE_TYPE_RSA_PUBLIC_KEY             0xA0000030
++#define TEE_TYPE_RSA_KEYPAIR                0xA1000030
++#define TEE_TYPE_DSA_PUBLIC_KEY             0xA0000031
++#define TEE_TYPE_DSA_KEYPAIR                0xA1000031
++#define TEE_TYPE_DH_KEYPAIR                 0xA1000032
++#define TEE_TYPE_ECDSA_PUBLIC_KEY           0xA0000041
++#define TEE_TYPE_ECDSA_KEYPAIR              0xA1000041
++#define TEE_TYPE_ECDH_PUBLIC_KEY            0xA0000042
++#define TEE_TYPE_ECDH_KEYPAIR               0xA1000042
++#define TEE_TYPE_ED25519_PUBLIC_KEY         0xA0000043
++#define TEE_TYPE_ED25519_KEYPAIR            0xA1000043
++#define TEE_TYPE_ED448_PUBLIC_KEY           0xA0000048
++#define TEE_TYPE_ED448_KEYPAIR              0xA1000048
++#define TEE_TYPE_X448_PUBLIC_KEY            0xA0000049
++#define TEE_TYPE_X448_KEYPAIR               0xA1000049
++#define TEE_TYPE_SM2_DSA_PUBLIC_KEY         0xA0000045
++#define TEE_TYPE_SM2_DSA_KEYPAIR            0xA1000045
++#define TEE_TYPE_SM2_KEP_PUBLIC_KEY         0xA0000046
++#define TEE_TYPE_SM2_KEP_KEYPAIR            0xA1000046
++#define TEE_TYPE_SM2_PKE_PUBLIC_KEY         0xA0000047
++#define TEE_TYPE_SM2_PKE_KEYPAIR            0xA1000047
++#define TEE_TYPE_HKDF                       0xA000004A
++#define TEE_TYPE_GENERIC_SECRET             0xA0000000
++#define TEE_TYPE_CORRUPTED_OBJECT           0xA00000BE
++#define TEE_TYPE_DATA                       0xA00000BF
++#define TEE_TYPE_X25519_PUBLIC_KEY          0xA0000044
++#define TEE_TYPE_X25519_KEYPAIR             0xA1000044
++#define TEE_TYPE_ILLEGAL_VALUE              0xEFFFFFFF
++
++/* List of Object or Operation Attributes */
++
++#define TEE_ATTR_SECRET_VALUE               0xC0000000
++#define TEE_ATTR_RSA_MODULUS                0xD0000130
++#define TEE_ATTR_RSA_PUBLIC_EXPONENT        0xD0000230
++#define TEE_ATTR_RSA_PRIVATE_EXPONENT       0xC0000330
++#define TEE_ATTR_RSA_PRIME1                 0xC0000430
++#define TEE_ATTR_RSA_PRIME2                 0xC0000530
++#define TEE_ATTR_RSA_EXPONENT1              0xC0000630
++#define TEE_ATTR_RSA_EXPONENT2              0xC0000730
++#define TEE_ATTR_RSA_COEFFICIENT            0xC0000830
++#define TEE_ATTR_DSA_PRIME                  0xD0001031
++#define TEE_ATTR_DSA_SUBPRIME               0xD0001131
++#define TEE_ATTR_DSA_BASE                   0xD0001231
++#define TEE_ATTR_DSA_PUBLIC_VALUE           0xD0000131
++#define TEE_ATTR_DSA_PRIVATE_VALUE          0xC0000231
++#define TEE_ATTR_DH_PRIME                   0xD0001032
++#define TEE_ATTR_DH_SUBPRIME                0xD0001132
++#define TEE_ATTR_DH_BASE                    0xD0001232
++#define TEE_ATTR_DH_X_BITS                  0xF0001332
++#define TEE_ATTR_DH_PUBLIC_VALUE            0xD0000132
++#define TEE_ATTR_DH_PRIVATE_VALUE           0xC0000232
++#define TEE_ATTR_RSA_OAEP_LABEL             0xD0000930
++#define TEE_ATTR_RSA_OAEP_MGF_HASH          0xD0000931
++#define TEE_ATTR_RSA_PSS_SALT_LENGTH        0xF0000A30
++#define TEE_ATTR_ECC_PUBLIC_VALUE_X         0xD0000141
++#define TEE_ATTR_ECC_PUBLIC_VALUE_Y         0xD0000241
++#define TEE_ATTR_ECC_PRIVATE_VALUE          0xC0000341
++#define TEE_ATTR_ECC_CURVE                  0xF0000441
++#define TEE_ATTR_SM2_ID_INITIATOR           0xD0000446
++#define TEE_ATTR_SM2_ID_RESPONDER           0xD0000546
++#define TEE_ATTR_SM2_KEP_USER               0xF0000646
++#define TEE_ATTR_SM2_KEP_CONFIRMATION_IN    0xD0000746
++#define TEE_ATTR_SM2_KEP_CONFIRMATION_OUT   0xD0000846
++
++/*
++ * Commit 5b385b3f835d ("core: crypto: add support for SM2 KEP") defined by
++ * mistake the wrong values for these two. OP-TEE recognizes these two as
++ * alternative IDs in parallel with the correct official values when
++ * supplied as parameters when deriving a key using the TEE_ALG_SM2_KEP
++ * algorithm.
++ */
++#define __OPTEE_SM2_KEP_ATTR_ECC_EPHEMERAL_PUBLIC_VALUE_X 0xD0000946
++#define __OPTEE_SM2_KEP_ATTR_ECC_EPHEMERAL_PUBLIC_VALUE_Y 0xD0000A46
++
++#define TEE_ATTR_ECC_EPHEMERAL_PUBLIC_VALUE_X 0xD0000146
++#define TEE_ATTR_ECC_EPHEMERAL_PUBLIC_VALUE_Y 0xD0000246
++#define TEE_ATTR_EDDSA_CTX                  0xD0000643
++#define TEE_ATTR_ED25519_PUBLIC_VALUE       0xD0000743
++#define TEE_ATTR_ED25519_PRIVATE_VALUE      0xC0000843
++#define TEE_ATTR_X25519_PUBLIC_VALUE        0xD0000944
++#define TEE_ATTR_X25519_PRIVATE_VALUE       0xC0000A44
++#define TEE_ATTR_EDDSA_PREHASH              0xF0000004
++#define TEE_ATTR_X448_PUBLIC_VALUE          0xD0000A45
++#define TEE_ATTR_X448_PRIVATE_VALUE         0xC0000A46
++#define TEE_ATTR_HKDF_SALT                  0xD0000946
++#define TEE_ATTR_HKDF_INFO                  0xD0000A46
++#define TEE_ATTR_HKDF_HASH_ALGORITHM        0xF0000B46
++#define TEE_ATTR_KDF_KEY_SIZE               0xF0000C46
++
++#define TEE_ATTR_FLAG_PUBLIC		(1 << 28)
++#define TEE_ATTR_FLAG_VALUE		(1 << 29)
++/*
++ * Deprecated, but kept for backwards compatibility
++ *
++ * Be careful with GPD TEE Internal API specification v1.0 where table 6-12
++ * defines BIT [28] with the right meaning whereas sections 5.4.3 and 5.4.4
++ * falsely describe a reversed bit flag value meaning.
++ */
++#define TEE_ATTR_BIT_PROTECTED		TEE_ATTR_FLAG_PUBLIC
++#define TEE_ATTR_BIT_VALUE		TEE_ATTR_FLAG_VALUE
++
++/* List of Supported ECC Curves */
++#define TEE_CRYPTO_ELEMENT_NONE             0x00000000
++#define TEE_ECC_CURVE_NIST_P192             0x00000001
++#define TEE_ECC_CURVE_NIST_P224             0x00000002
++#define TEE_ECC_CURVE_NIST_P256             0x00000003
++#define TEE_ECC_CURVE_NIST_P384             0x00000004
++#define TEE_ECC_CURVE_NIST_P521             0x00000005
++#define TEE_ECC_CURVE_25519                 0x00000300
++#define TEE_ECC_CURVE_SM2                   0x00000400
++
++/* Panicked Functions Identification */
++/* TA Interface */
++#define TEE_PANIC_ID_TA_CLOSESESSIONENTRYPOINT      0x00000101
++#define TEE_PANIC_ID_TA_CREATEENTRYPOINT            0x00000102
++#define TEE_PANIC_ID_TA_DESTROYENTRYPOINT           0x00000103
++#define TEE_PANIC_ID_TA_INVOKECOMMANDENTRYPOINT     0x00000104
++#define TEE_PANIC_ID_TA_OPENSESSIONENTRYPOINT       0x00000105
++/* Property Access */
++#define TEE_PANIC_ID_TEE_ALLOCATEPROPERTYENUMERATOR 0x00000201
++#define TEE_PANIC_ID_TEE_FREEPROPERTYENUMERATOR     0x00000202
++#define TEE_PANIC_ID_TEE_GETNEXTPROPERTY            0x00000203
++#define TEE_PANIC_ID_TEE_GETPROPERTYASBINARYBLOCK   0x00000204
++#define TEE_PANIC_ID_TEE_GETPROPERTYASBOOL          0x00000205
++#define TEE_PANIC_ID_TEE_GETPROPERTYASIDENTITY      0x00000206
++#define TEE_PANIC_ID_TEE_GETPROPERTYASSTRING        0x00000207
++#define TEE_PANIC_ID_TEE_GETPROPERTYASU32           0x00000208
++#define TEE_PANIC_ID_TEE_GETPROPERTYASUUID          0x00000209
++#define TEE_PANIC_ID_TEE_GETPROPERTYNAME            0x0000020A
++#define TEE_PANIC_ID_TEE_RESETPROPERTYENUMERATOR    0x0000020B
++#define TEE_PANIC_ID_TEE_STARTPROPERTYENUMERATOR    0x0000020C
++/* Panic Function */
++#define TEE_PANIC_ID_TEE_PANIC                      0x00000301
++/* Internal Client API */
++#define TEE_PANIC_ID_TEE_CLOSETASESSION             0x00000401
++#define TEE_PANIC_ID_TEE_INVOKETACOMMAND            0x00000402
++#define TEE_PANIC_ID_TEE_OPENTASESSION              0x00000403
++/* Cancellation */
++#define TEE_PANIC_ID_TEE_GETCANCELLATIONFLAG        0x00000501
++#define TEE_PANIC_ID_TEE_MASKCANCELLATION           0x00000502
++#define TEE_PANIC_ID_TEE_UNMASKCANCELLATION         0x00000503
++/* Memory Management */
++#define TEE_PANIC_ID_TEE_CHECKMEMORYACCESSRIGHTS    0x00000601
++#define TEE_PANIC_ID_TEE_FREE                       0x00000602
++#define TEE_PANIC_ID_TEE_GETINSTANCEDATA            0x00000603
++#define TEE_PANIC_ID_TEE_MALLOC                     0x00000604
++#define TEE_PANIC_ID_TEE_MEMCOMPARE                 0x00000605
++#define TEE_PANIC_ID_TEE_MEMFILL                    0x00000606
++#define TEE_PANIC_ID_TEE_MEMMOVE                    0x00000607
++#define TEE_PANIC_ID_TEE_REALLOC                    0x00000608
++#define TEE_PANIC_ID_TEE_SETINSTANCEDATA            0x00000609
++/* Generic Object */
++#define TEE_PANIC_ID_TEE_CLOSEOBJECT                0x00000701
++#define TEE_PANIC_ID_TEE_GETOBJECTBUFFERATTRIBUTE   0x00000702
++/* deprecated */
++#define TEE_PANIC_ID_TEE_GETOBJECTINFO              0x00000703
++#define TEE_PANIC_ID_TEE_GETOBJECTVALUEATTRIBUTE    0x00000704
++/* deprecated */
++#define TEE_PANIC_ID_TEE_RESTRICTOBJECTUSAGE        0x00000705
++#define TEE_PANIC_ID_TEE_GETOBJECTINFO1             0x00000706
++#define TEE_PANIC_ID_TEE_RESTRICTOBJECTUSAGE1       0x00000707
++/* Transient Object */
++#define TEE_PANIC_ID_TEE_ALLOCATETRANSIENTOBJECT    0x00000801
++/* deprecated */
++#define TEE_PANIC_ID_TEE_COPYOBJECTATTRIBUTES       0x00000802
++#define TEE_PANIC_ID_TEE_FREETRANSIENTOBJECT        0x00000803
++#define TEE_PANIC_ID_TEE_GENERATEKEY                0x00000804
++#define TEE_PANIC_ID_TEE_INITREFATTRIBUTE           0x00000805
++#define TEE_PANIC_ID_TEE_INITVALUEATTRIBUTE         0x00000806
++#define TEE_PANIC_ID_TEE_POPULATETRANSIENTOBJECT    0x00000807
++#define TEE_PANIC_ID_TEE_RESETTRANSIENTOBJECT       0x00000808
++#define TEE_PANIC_ID_TEE_COPYOBJECTATTRIBUTES1      0x00000809
++/* Persistent Object */
++/* deprecated */
++#define TEE_PANIC_ID_TEE_CLOSEANDDELETEPERSISTENTOBJECT  0x00000901
++#define TEE_PANIC_ID_TEE_CREATEPERSISTENTOBJECT          0x00000902
++#define TEE_PANIC_ID_TEE_OPENPERSISTENTOBJECT            0x00000903
++#define TEE_PANIC_ID_TEE_RENAMEPERSISTENTOBJECT          0x00000904
++#define TEE_PANIC_ID_TEE_CLOSEANDDELETEPERSISTENTOBJECT1 0x00000905
++/* Persistent Object Enumeration */
++#define TEE_PANIC_ID_TEE_ALLOCATEPERSISTENTOBJECTENUMERATOR 0x00000A01
++#define TEE_PANIC_ID_TEE_FREEPERSISTENTOBJECTENUMERATOR     0x00000A02
++#define TEE_PANIC_ID_TEE_GETNEXTPERSISTENTOBJECT            0x00000A03
++#define TEE_PANIC_ID_TEE_RESETPERSISTENTOBJECTENUMERATOR    0x00000A04
++#define TEE_PANIC_ID_TEE_STARTPERSISTENTOBJECTENUMERATOR    0x00000A05
++/* Data Stream Access */
++#define TEE_PANIC_ID_TEE_READOBJECTDATA             0x00000B01
++#define TEE_PANIC_ID_TEE_SEEKOBJECTDATA             0x00000B02
++#define TEE_PANIC_ID_TEE_TRUNCATEOBJECTDATA         0x00000B03
++#define TEE_PANIC_ID_TEE_WRITEOBJECTDATA            0x00000B04
++/* Generic Operation */
++#define TEE_PANIC_ID_TEE_ALLOCATEOPERATION          0x00000C01
++#define TEE_PANIC_ID_TEE_COPYOPERATION              0x00000C02
++#define TEE_PANIC_ID_TEE_FREEOPERATION              0x00000C03
++#define TEE_PANIC_ID_TEE_GETOPERATIONINFO           0x00000C04
++#define TEE_PANIC_ID_TEE_RESETOPERATION             0x00000C05
++#define TEE_PANIC_ID_TEE_SETOPERATIONKEY            0x00000C06
++#define TEE_PANIC_ID_TEE_SETOPERATIONKEY2           0x00000C07
++#define TEE_PANIC_ID_TEE_GETOPERATIONINFOMULTIPLE   0x00000C08
++/* Message Digest */
++#define TEE_PANIC_ID_TEE_DIGESTDOFINAL              0x00000D01
++#define TEE_PANIC_ID_TEE_DIGESTUPDATE               0x00000D02
++/* Symmetric Cipher */
++#define TEE_PANIC_ID_TEE_CIPHERDOFINAL              0x00000E01
++#define TEE_PANIC_ID_TEE_CIPHERINIT                 0x00000E02
++#define TEE_PANIC_ID_TEE_CIPHERUPDATE               0x00000E03
++/* MAC */
++#define TEE_PANIC_ID_TEE_MACCOMPAREFINAL            0x00000F01
++#define TEE_PANIC_ID_TEE_MACCOMPUTEFINAL            0x00000F02
++#define TEE_PANIC_ID_TEE_MACINIT                    0x00000F03
++#define TEE_PANIC_ID_TEE_MACUPDATE                  0x00000F04
++/* Authenticated Encryption */
++#define TEE_PANIC_ID_TEE_AEDECRYPTFINAL             0x00001001
++#define TEE_PANIC_ID_TEE_AEENCRYPTFINAL             0x00001002
++#define TEE_PANIC_ID_TEE_AEINIT                     0x00001003
++#define TEE_PANIC_ID_TEE_AEUPDATE                   0x00001004
++#define TEE_PANIC_ID_TEE_AEUPDATEAAD                0x00001005
++/* Asymmetric */
++#define TEE_PANIC_ID_TEE_ASYMMETRICDECRYPT          0x00001101
++#define TEE_PANIC_ID_TEE_ASYMMETRICENCRYPT          0x00001102
++#define TEE_PANIC_ID_TEE_ASYMMETRICSIGNDIGEST       0x00001103
++#define TEE_PANIC_ID_TEE_ASYMMETRICVERIFYDIGEST     0x00001104
++/* Key Derivation */
++#define TEE_PANIC_ID_TEE_DERIVEKEY                  0x00001201
++/* Random Data Generation */
++#define TEE_PANIC_ID_TEE_GENERATERANDOM             0x00001301
++/* Time */
++#define TEE_PANIC_ID_TEE_GETREETIME                 0x00001401
++#define TEE_PANIC_ID_TEE_GETSYSTEMTIME              0x00001402
++#define TEE_PANIC_ID_TEE_GETTAPERSISTENTTIME        0x00001403
++#define TEE_PANIC_ID_TEE_SETTAPERSISTENTTIME        0x00001404
++#define TEE_PANIC_ID_TEE_WAIT                       0x00001405
++/* Memory Allocation and Size of Objects */
++#define TEE_PANIC_ID_TEE_BIGINTFMMCONTEXTSIZEINU32  0x00001501
++#define TEE_PANIC_ID_TEE_BIGINTFMMSIZEINU32         0x00001502
++/* Initialization */
++#define TEE_PANIC_ID_TEE_BIGINTINIT                 0x00001601
++#define TEE_PANIC_ID_TEE_BIGINTINITFMM              0x00001602
++#define TEE_PANIC_ID_TEE_BIGINTINITFMMCONTEXT       0x00001603
++/* Converter */
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTFROMOCTETSTRING 0x00001701
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTFROMS32         0x00001702
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTTOOCTETSTRING   0x00001703
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTTOS32           0x00001704
++/* Logical Operation */
++#define TEE_PANIC_ID_TEE_BIGINTCMP                  0x00001801
++#define TEE_PANIC_ID_TEE_BIGINTCMPS32               0x00001802
++#define TEE_PANIC_ID_TEE_BIGINTGETBIT               0x00001803
++#define TEE_PANIC_ID_TEE_BIGINTGETBITCOUNT          0x00001804
++#define TEE_PANIC_ID_TEE_BIGINTSHIFTRIGHT           0x00001805
++/* Basic Arithmetic */
++#define TEE_PANIC_ID_TEE_BIGINTADD                  0x00001901
++#define TEE_PANIC_ID_TEE_BIGINTDIV                  0x00001902
++#define TEE_PANIC_ID_TEE_BIGINTMUL                  0x00001903
++#define TEE_PANIC_ID_TEE_BIGINTNEG                  0x00001904
++#define TEE_PANIC_ID_TEE_BIGINTSQUARE               0x00001905
++#define TEE_PANIC_ID_TEE_BIGINTSUB                  0x00001906
++/* Modular Arithmetic */
++#define TEE_PANIC_ID_TEE_BIGINTADDMOD               0x00001A01
++#define TEE_PANIC_ID_TEE_BIGINTINVMOD               0x00001A02
++#define TEE_PANIC_ID_TEE_BIGINTMOD                  0x00001A03
++#define TEE_PANIC_ID_TEE_BIGINTMULMOD               0x00001A04
++#define TEE_PANIC_ID_TEE_BIGINTSQUAREMOD            0x00001A05
++#define TEE_PANIC_ID_TEE_BIGINTSUBMOD               0x00001A06
++/* Other Arithmetic */
++#define TEE_PANIC_ID_TEE_BIGINTCOMPUTEEXTENDEDGCD   0x00001B01
++#define TEE_PANIC_ID_TEE_BIGINTISPROBABLEPRIME      0x00001B02
++#define TEE_PANIC_ID_TEE_BIGINTRELATIVEPRIME        0x00001B03
++/* Fast Modular Multiplication */
++#define TEE_PANIC_ID_TEE_BIGINTCOMPUTEFMM           0x00001C01
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTFROMFMM       0x00001C02
++#define TEE_PANIC_ID_TEE_BIGINTCONVERTTOFMM         0x00001C03
++
++/*
++ * The macro TEE_PARAM_TYPES can be used to construct a value that you can
++ * compare against an incoming paramTypes to check the type of all the
++ * parameters in one comparison, like in the following example:
++ * if (paramTypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
++ *                                  TEE_PARAM_TYPE_MEMREF_OUPUT,
++ *                                  TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE)) {
++ *      return TEE_ERROR_BAD_PARAMETERS;
++ *  }
++ */
++#define TEE_PARAM_TYPES(t0,t1,t2,t3) \
++   ((t0) | ((t1) << 4) | ((t2) << 8) | ((t3) << 12))
++
++/*
++ * The macro TEE_PARAM_TYPE_GET can be used to extract the type of a given
++ * parameter from paramTypes if you need more fine-grained type checking.
++ */
++#define TEE_PARAM_TYPE_GET(t, i) ((((uint32_t)t) >> ((i)*4)) & 0xF)
++
++/*
++ * The macro TEE_PARAM_TYPE_SET can be used to load the type of a given
++ * parameter from paramTypes without specifying all types (TEE_PARAM_TYPES)
++ */
++#define TEE_PARAM_TYPE_SET(t, i) (((uint32_t)(t) & 0xF) << ((i)*4))
++
++/* Not specified in the standard */
++#define TEE_NUM_PARAMS  4
++
++/* TEE Arithmetical APIs */
++
++#define TEE_BigIntSizeInU32(n) ((((n)+31)/32)+2)
++
++#endif /* TEE_API_DEFINES_H */
+diff --git a/perf_concurrency/host/include/tee_api_defines_extensions.h b/perf_concurrency/host/include/tee_api_defines_extensions.h
+new file mode 100644
+index 0000000..e908b37
+--- /dev/null
++++ b/perf_concurrency/host/include/tee_api_defines_extensions.h
+@@ -0,0 +1,140 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014-2021, Linaro Limited
++ * Copyright (c) 2021, SumUp Services GmbH
++ */
++
++#ifndef TEE_API_DEFINES_EXTENSIONS_H
++#define TEE_API_DEFINES_EXTENSIONS_H
++
++/*
++ * RSA signatures with MD5 hash
++ * Values prefixed with vendor ID bit31 with by TEE bitfields IDs
++ */
++#define TEE_ALG_RSASSA_PKCS1_PSS_MGF1_MD5       0xF0111930
++#define TEE_ALG_RSAES_PKCS1_OAEP_MGF1_MD5       0xF0110230
++
++/*
++ * API extended result codes as per TEE_Result IDs defined in GPD TEE
++ * Internal Core API specification v1.1:
++ *
++ * 0x70000000 - 0x7FFFFFFF: Reserved for implementation-specific return
++ *			    code providing non-error information
++ * 0x80000000 - 0x8FFFFFFF: Reserved for implementation-specific errors
++ *
++ * TEE_ERROR_DEFER_DRIVER_INIT - Device driver failed to initialize because
++ * the driver depends on a device not yet initialized.
++ */
++#define TEE_ERROR_DEFER_DRIVER_INIT	0x80000000
++
++/*
++ * TEE_ERROR_NODE_DISABLED - Device driver failed to initialize because it is
++ * not allocated for TEE environment.
++ */
++#define TEE_ERROR_NODE_DISABLED		0x80000001
++
++/*
++ * HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
++ */
++
++#define TEE_ALG_HKDF_MD5_DERIVE_KEY     0x800010C0
++#define TEE_ALG_HKDF_SHA1_DERIVE_KEY    0x800020C0
++#define TEE_ALG_HKDF_SHA224_DERIVE_KEY  0x800030C0
++#define TEE_ALG_HKDF_SHA256_DERIVE_KEY  0x800040C0
++#define TEE_ALG_HKDF_SHA384_DERIVE_KEY  0x800050C0
++#define TEE_ALG_HKDF_SHA512_DERIVE_KEY  0x800060C0
++
++#define TEE_TYPE_HKDF_IKM               0xA10000C0
++
++#define TEE_ATTR_HKDF_IKM               0xC00001C0
++/*
++ * There is a name clash with the  official attributes TEE_ATTR_HKDF_SALT
++ * and TEE_ATTR_HKDF_INFO so define these alternative ID.
++ */
++#define __OPTEE_TEE_ATTR_HKDF_SALT      0xD00002C0
++#define __OPTEE_ATTR_HKDF_INFO          0xD00003C0
++#define TEE_ATTR_HKDF_OKM_LENGTH        0xF00004C0
++
++/*
++ * Concatenation Key Derivation Function (Concat KDF)
++ * NIST SP 800-56A section 5.8.1
++ */
++
++#define TEE_ALG_CONCAT_KDF_SHA1_DERIVE_KEY    0x800020C1
++#define TEE_ALG_CONCAT_KDF_SHA224_DERIVE_KEY  0x800030C1
++#define TEE_ALG_CONCAT_KDF_SHA256_DERIVE_KEY  0x800040C1
++#define TEE_ALG_CONCAT_KDF_SHA384_DERIVE_KEY  0x800050C1
++#define TEE_ALG_CONCAT_KDF_SHA512_DERIVE_KEY  0x800060C1
++
++#define TEE_TYPE_CONCAT_KDF_Z                 0xA10000C1
++
++#define TEE_ATTR_CONCAT_KDF_Z                 0xC00001C1
++#define TEE_ATTR_CONCAT_KDF_OTHER_INFO        0xD00002C1
++#define TEE_ATTR_CONCAT_KDF_DKM_LENGTH        0xF00003C1
++
++/*
++ * PKCS #5 v2.0 Key Derivation Function 2 (PBKDF2)
++ * RFC 2898 section 5.2
++ * https://www.ietf.org/rfc/rfc2898.txt
++ */
++
++#define TEE_ALG_PBKDF2_HMAC_SHA1_DERIVE_KEY 0x800020C2
++
++#define TEE_TYPE_PBKDF2_PASSWORD            0xA10000C2
++
++#define TEE_ATTR_PBKDF2_PASSWORD            0xC00001C2
++#define TEE_ATTR_PBKDF2_SALT                0xD00002C2
++#define TEE_ATTR_PBKDF2_ITERATION_COUNT     0xF00003C2
++#define TEE_ATTR_PBKDF2_DKM_LENGTH          0xF00004C2
++
++/*
++ * PKCS#1 v1.5 RSASSA pre-hashed sign/verify
++ */
++
++#define TEE_ALG_RSASSA_PKCS1_V1_5	0xF0000830
++
++/*
++ *  TDEA CMAC (NIST SP800-38B)
++ */
++#define TEE_ALG_DES3_CMAC	0xF0000613
++
++/*
++ *  SM4-XTS
++ */
++#define TEE_ALG_SM4_XTS 0xF0000414
++
++/*
++ * Implementation-specific object storage constants
++ */
++
++/* Storage is provided by the Rich Execution Environment (REE) */
++#define TEE_STORAGE_PRIVATE_REE	 0x80000000
++/* Storage is the Replay Protected Memory Block partition of an eMMC device */
++#define TEE_STORAGE_PRIVATE_RPMB 0x80000100
++/* Was TEE_STORAGE_PRIVATE_SQL, which isn't supported any longer */
++#define TEE_STORAGE_PRIVATE_SQL_RESERVED  0x80000200
++
++/*
++ * Extension of "Memory Access Rights Constants"
++ * #define TEE_MEMORY_ACCESS_READ             0x00000001
++ * #define TEE_MEMORY_ACCESS_WRITE            0x00000002
++ * #define TEE_MEMORY_ACCESS_ANY_OWNER        0x00000004
++ *
++ * TEE_MEMORY_ACCESS_NONSECURE : if set TEE_CheckMemoryAccessRights()
++ * successfully returns only if target vmem range is mapped non-secure.
++ *
++ * TEE_MEMORY_ACCESS_SECURE : if set TEE_CheckMemoryAccessRights()
++ * successfully returns only if target vmem range is mapped secure.
++
++ */
++#define TEE_MEMORY_ACCESS_NONSECURE          0x10000000
++#define TEE_MEMORY_ACCESS_SECURE             0x20000000
++
++/*
++ * Implementation-specific login types
++ */
++
++/* Private login method for REE kernel clients */
++#define TEE_LOGIN_REE_KERNEL		0x80000000
++
++#endif /* TEE_API_DEFINES_EXTENSIONS_H */
+diff --git a/perf_concurrency/host/include/tee_api_types.h b/perf_concurrency/host/include/tee_api_types.h
+new file mode 100644
+index 0000000..b78acd4
+--- /dev/null
++++ b/perf_concurrency/host/include/tee_api_types.h
+@@ -0,0 +1,227 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Copyright (c) 2014, STMicroelectronics International N.V.
++ */
++
++/* Based on GP TEE Internal API Specification Version 0.11 */
++#ifndef TEE_API_TYPES_H
++#define TEE_API_TYPES_H
++
++#include <compiler.h>
++#include <inttypes.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <tee_api_defines.h>
++
++/*
++ * Common Definitions
++ */
++
++typedef uint32_t TEE_Result;
++
++typedef struct {
++	uint32_t timeLow;
++	uint16_t timeMid;
++	uint16_t timeHiAndVersion;
++	uint8_t clockSeqAndNode[8];
++} TEE_UUID;
++
++/*
++ * The TEE_Identity structure defines the full identity of a Client:
++ * - login is one of the TEE_LOGIN_XXX constants
++ * - uuid contains the client UUID or Nil if not applicable
++ */
++typedef struct {
++	uint32_t login;
++	TEE_UUID uuid;
++} TEE_Identity;
++
++/*
++ * This union describes one parameter passed by the Trusted Core Framework
++ * to the entry points TA_OpenSessionEntryPoint or
++ * TA_InvokeCommandEntryPoint or by the TA to the functions
++ * TEE_OpenTASession or TEE_InvokeTACommand.
++ *
++ * Which of the field value or memref to select is determined by the
++ * parameter type specified in the argument paramTypes passed to the entry
++ * point.
++*/
++typedef union {
++	struct {
++		void *buffer;
++		size_t size;
++	} memref;
++	struct {
++		uint32_t a;
++		uint32_t b;
++	} value;
++} TEE_Param;
++
++typedef union {
++	struct {
++		void *buffer;
++		uint32_t size;
++	} memref;
++	struct {
++		uint32_t a;
++		uint32_t b;
++	} value;
++} __GP11_TEE_Param;
++
++/*
++ * The type of opaque handles on TA Session. These handles are returned by
++ * the function TEE_OpenTASession.
++ */
++typedef struct __TEE_TASessionHandle *TEE_TASessionHandle;
++
++/*
++ * The type of opaque handles on property sets or enumerators. These
++ * handles are either one of the pseudo handles TEE_PROPSET_XXX or are
++ * returned by the function TEE_AllocatePropertyEnumerator.
++*/
++typedef struct __TEE_PropSetHandle *TEE_PropSetHandle;
++
++typedef struct __TEE_ObjectHandle *TEE_ObjectHandle;
++typedef struct __TEE_ObjectEnumHandle *TEE_ObjectEnumHandle;
++typedef struct __TEE_OperationHandle *TEE_OperationHandle;
++
++/*
++ * Storage Definitions
++ */
++
++typedef uint32_t TEE_ObjectType;
++
++typedef struct {
++	uint32_t objectType;
++	uint32_t objectSize;
++	uint32_t maxObjectSize;
++	uint32_t objectUsage;
++	size_t dataSize;
++	size_t dataPosition;
++	uint32_t handleFlags;
++} TEE_ObjectInfo;
++
++typedef struct {
++	uint32_t objectType;
++	__extension__ union {
++		uint32_t keySize;	/* used in 1.1 spec */
++		uint32_t objectSize;	/* used in 1.1.1 spec */
++	};
++	__extension__ union {
++		uint32_t maxKeySize;	/* used in 1.1 spec */
++		uint32_t maxObjectSize;	/* used in 1.1.1 spec */
++	};
++	uint32_t objectUsage;
++	uint32_t dataSize;
++	uint32_t dataPosition;
++	uint32_t handleFlags;
++} __GP11_TEE_ObjectInfo;
++
++typedef uint32_t TEE_Whence;
++
++typedef struct {
++	uint32_t attributeID;
++	union {
++		struct {
++			void *buffer;
++			size_t length;
++		} ref;
++		struct {
++			uint32_t a, b;
++		} value;
++	} content;
++} TEE_Attribute;
++
++typedef struct {
++	uint32_t attributeID;
++	union {
++		struct {
++			void *buffer;
++			uint32_t length;
++		} ref;
++		struct {
++			uint32_t a, b;
++		} value;
++	} content;
++} __GP11_TEE_Attribute;
++
++/* Cryptographic Operations API */
++
++typedef uint32_t TEE_OperationMode;
++
++typedef struct {
++	uint32_t algorithm;
++	uint32_t operationClass;
++	uint32_t mode;
++	uint32_t digestLength;
++	uint32_t maxKeySize;
++	uint32_t keySize;
++	uint32_t requiredKeyUsage;
++	uint32_t handleState;
++} TEE_OperationInfo;
++
++typedef struct {
++	uint32_t keySize;
++	uint32_t requiredKeyUsage;
++} TEE_OperationInfoKey;
++
++typedef struct {
++	uint32_t algorithm;
++	uint32_t operationClass;
++	uint32_t mode;
++	uint32_t digestLength;
++	uint32_t maxKeySize;
++	uint32_t handleState;
++	uint32_t operationState;
++	uint32_t numberOfKeys;
++	TEE_OperationInfoKey keyInformation[];
++} TEE_OperationInfoMultiple;
++
++/* Time & Date API */
++
++typedef struct {
++	uint32_t seconds;
++	uint32_t millis;
++} TEE_Time;
++
++/* TEE Arithmetical APIs */
++
++typedef uint32_t TEE_BigInt;
++
++typedef uint32_t TEE_BigIntFMM;
++
++typedef uint32_t TEE_BigIntFMMContext __aligned(__alignof__(void *));
++
++/* Tee Secure Element APIs */
++
++typedef struct __TEE_SEServiceHandle *TEE_SEServiceHandle;
++typedef struct __TEE_SEReaderHandle *TEE_SEReaderHandle;
++typedef struct __TEE_SESessionHandle *TEE_SESessionHandle;
++typedef struct __TEE_SEChannelHandle *TEE_SEChannelHandle;
++
++typedef struct {
++	bool sePresent;
++	bool teeOnly;
++	bool selectResponseEnable;
++} TEE_SEReaderProperties;
++
++typedef struct {
++	uint8_t *buffer;
++	size_t bufferLen;
++} TEE_SEAID;
++
++/* Other definitions */
++typedef uint32_t TEE_ErrorOrigin;
++typedef void *TEE_Session;
++
++#define TEE_MEM_INPUT   0x00000001
++#define TEE_MEM_OUTPUT  0x00000002
++
++#define TEE_MEMREF_0_USED  0x00000001
++#define TEE_MEMREF_1_USED  0x00000002
++#define TEE_MEMREF_2_USED  0x00000004
++#define TEE_MEMREF_3_USED  0x00000008
++
++#define TEE_SE_READER_NAME_MAX	20
++
++#endif /* TEE_API_TYPES_H */
+diff --git a/perf_concurrency/host/main.c b/perf_concurrency/host/main.c
+new file mode 100644
+index 0000000..0c3d358
+--- /dev/null
++++ b/perf_concurrency/host/main.c
+@@ -0,0 +1,433 @@
++#include <err.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/sysinfo.h>
++#include <unistd.h>
++
++/* OP-TEE TEE client API (built by optee_client) */
++#include <tee_client_api.h>
++
++#include "ta_concurrent.h"
++#include "ta_concurrent_large.h"
++
++/* For the UUID (found in the TA's h-file(s)) */
++#include "perf_concurrency.h"
++#include "pta_invoke_tests.h"
++
++const TEEC_UUID pta_invoke_tests_ta_uuid = PTA_INVOKE_TESTS_UUID;
++const TEEC_UUID concurrent_ta_uuid = TA_CONCURRENT_UUID;
++const TEEC_UUID concurrent_large_ta_uuid = TA_CONCURRENT_LARGE_UUID;
++
++#define TEST_1003_THREAD_COUNT		(3 * 4)
++#define TEST_1013_THREAD_COUNT		(3 * 4)
++
++TEEC_Context xtest_teec_ctx;
++
++TEEC_Result xtest_teec_ctx_init(void)
++{
++	return TEEC_InitializeContext(NULL, &xtest_teec_ctx);
++}
++
++void xtest_teec_ctx_deinit(void)
++{
++	TEEC_FinalizeContext(&xtest_teec_ctx);
++}
++
++TEEC_Result xtest_teec_open_session(TEEC_Session *session,
++				    const TEEC_UUID *uuid, TEEC_Operation *op,
++				    uint32_t *ret_orig)
++{
++	return TEEC_OpenSession(&xtest_teec_ctx, session, uuid,
++				TEEC_LOGIN_PUBLIC, NULL, op, ret_orig);
++}
++
++
++static void *test_1003_thread(void *arg)
++{
++	struct test_1003_arg *a = arg;
++	TEEC_Session session = { };
++	size_t rounds = 64 * 1024;
++	size_t n = 0;
++
++	a->res = xtest_teec_open_session(&session, &pta_invoke_tests_ta_uuid,
++					 NULL, &a->error_orig);
++	if (a->res != TEEC_SUCCESS) {
++		printf("xtest_teec_open_session failed: res 0x%x\n", a->res);
++		return NULL;
++	}
++
++	for (n = 0; n < a->repeat; n++) {
++		TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++
++		op.params[0].value.a = a->test_type;
++		op.params[0].value.b = rounds;
++
++		op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT,
++						 TEEC_VALUE_OUTPUT,
++						 TEEC_NONE, TEEC_NONE);
++		a->res = TEEC_InvokeCommand(&session,
++					    PTA_INVOKE_TESTS_CMD_MUTEX,
++					    &op, &a->error_orig);
++		if (a->test_type == PTA_MUTEX_TEST_WRITER &&
++		    op.params[1].value.b != 1) {
++			a->res = TEEC_ERROR_BAD_STATE;
++			a->error_orig = 42;
++			break;
++		}
++
++		if (a->test_type == PTA_MUTEX_TEST_READER) {
++			if (op.params[1].value.a > a->max_before_lockers)
++				a->max_before_lockers = op.params[1].value.a;
++
++			if (op.params[1].value.b > a->max_during_lockers)
++				a->max_during_lockers = op.params[1].value.b;
++
++			a->before_lockers += op.params[1].value.a;
++			a->during_lockers += op.params[1].value.b;
++		}
++	}
++	TEEC_CloseSession(&session);
++
++	if (a->res != TEEC_SUCCESS) {
++		printf("TEEC_InvokeCommand failed: res 0x%x\n", a->res);
++		return NULL;
++	}
++
++	return NULL;
++}
++
++static void xtest_tee_test_1003()
++{
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	TEEC_Session session = { };
++	uint32_t ret_orig = 0;
++	size_t max_read_concurrency = 0;
++	size_t max_read_waiters = 0;
++	size_t num_concurrent_read_lockers = 0;
++	size_t num_concurrent_read_waiters = 0;
++	size_t n = 0;
++	size_t repeat = 1000;
++	size_t nt = TEST_1003_THREAD_COUNT;
++	double mean_read_concurrency = 0;
++	double mean_read_waiters = 0;
++	size_t num_writers = 0;
++	size_t num_readers = 0;
++	struct test_1003_arg *arg;
++	pthread_t *thr;
++
++	printf("[xtest 1003] Input num_thread and repeat: ");
++	scanf("%d %d", &nt, &repeat);
++
++	arg = (struct test_1003_arg *)malloc(sizeof(struct test_1003_arg) * nt);
++	thr = (pthread_t *)malloc(sizeof(pthread_t) * nt);
++
++	/* Pseudo TA is optional: warn and nicely exit if not found */
++	res = xtest_teec_open_session(&session, &pta_invoke_tests_ta_uuid, NULL,
++				      &ret_orig);
++	if (res == TEEC_ERROR_ITEM_NOT_FOUND) {
++		printf(" - 1003 -   skip test, pseudo TA not found");
++		return;
++	}
++	TEEC_CloseSession(&session);
++
++	for (n = 0; n < nt; n++) {
++		// if (n % 4 || nt < 4) {
++		if (true) {
++			arg[n].test_type = PTA_MUTEX_TEST_READER;
++			num_readers++;
++		} else {
++			arg[n].test_type = PTA_MUTEX_TEST_WRITER;
++			num_writers++;
++		}
++		arg[n].repeat = repeat;
++		if (pthread_create(thr + n, NULL, test_1003_thread, arg + n) != 0) {
++			printf("thread [%d] create failed!\n", n);
++			nt = n;
++		}
++	}
++
++	for (n = 0; n < nt; n++) {
++		if (pthread_join(thr[n], NULL) != 0) {
++			printf("thread [%d] join failed!\n", n);
++		}
++		if (arg[n].res != TEEC_SUCCESS) {
++			printf("thread [%d] got an unexpected value: 0x%x = %s, error origin: 0x%x = %s\n",
++				n, arg[n].res, get_result_name(arg[n].res),
++				arg[n].error_orig, get_origin_name(arg[n].error_orig));
++		}
++		if (arg[n].test_type == PTA_MUTEX_TEST_READER) {
++			if (arg[n].max_during_lockers > max_read_concurrency)
++				max_read_concurrency =
++					arg[n].max_during_lockers;
++
++			if (arg[n].max_before_lockers > max_read_waiters)
++				max_read_waiters = arg[n].max_before_lockers;
++
++			num_concurrent_read_lockers += arg[n].during_lockers;
++			num_concurrent_read_waiters += arg[n].before_lockers;
++		}
++	}
++
++	free(arg);
++	free(thr);
++
++	mean_read_concurrency = (double)num_concurrent_read_lockers /
++				(double)(repeat * num_readers);
++	mean_read_waiters = (double)num_concurrent_read_waiters /
++			    (double)(repeat * num_readers);
++
++	printf("    Number of parallel threads: %d (%zu writers and %zu readers)\n",
++		    TEST_1003_THREAD_COUNT, num_writers, num_readers);
++	printf("    Max read concurrency: %zu\n", max_read_concurrency);
++	printf("    Max read waiters: %zu\n", max_read_waiters);
++	printf("    Mean read concurrency: %g\n", mean_read_concurrency);
++	printf("    Mean read waiting: %g\n", mean_read_waiters);
++}
++
++
++static void *test_1013_thread(void *arg)
++{
++	struct test_1013_thread_arg *a = arg;
++	TEEC_Session session = { };
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint8_t p2 = TEEC_NONE;
++	uint8_t p3 = TEEC_NONE;
++
++	a->res = xtest_teec_open_session(&session, a->uuid, NULL,
++					 &a->error_orig);
++	if (a->res != TEEC_SUCCESS) {
++		printf("xtest_teec_open_session failed: res 0x%x\n", a->res);
++		return NULL;
++	}
++
++	op.params[0].memref.parent = a->shm;
++	op.params[0].memref.size = a->shm->size;
++	op.params[0].memref.offset = 0;
++	op.params[1].value.a = a->repeat;
++	op.params[1].value.b = 0;
++	op.params[2].tmpref.buffer = (void *)a->in;
++	op.params[2].tmpref.size = a->in_len;
++	op.params[3].tmpref.buffer = a->out;
++	op.params[3].tmpref.size = a->out_len;
++
++	if (a->in_len)
++		p2 = TEEC_MEMREF_TEMP_INPUT;
++	if (a->out_len)
++		p3 = TEEC_MEMREF_TEMP_OUTPUT;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INOUT,
++					 TEEC_VALUE_INOUT, p2, p3);
++
++	a->res = TEEC_InvokeCommand(&session, a->cmd, &op, &a->error_orig);
++	a->max_concurrency = op.params[1].value.b;
++	a->out_len = op.params[3].tmpref.size;
++	TEEC_CloseSession(&session);
++
++	if (a->res != TEEC_SUCCESS) {
++		printf("TEEC_InvokeCommand failed: res 0x%x\n", a->res);
++	}
++
++	return NULL;
++}
++
++static size_t xtest_tee_test_1013_single(double *mean_concurrency,
++				       const TEEC_UUID *uuid, size_t num_threads, size_t repeat)
++{
++	size_t n = 0;
++	size_t nt = 0;
++	TEEC_SharedMemory shm = { };
++	size_t max_concurrency = 0;
++	double concurrency = 0;
++	static const uint8_t sha256_in[] = { 'a', 'b', 'c' };
++	uint8_t out[32] = { };
++	bool skip = false;
++
++	struct test_1013_thread_arg *arg;
++	pthread_t *thr;
++
++	shm.size = sizeof(struct ta_concurrent_shm);
++	shm.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
++	if (TEEC_AllocateSharedMemory(&xtest_teec_ctx, &shm) != TEEC_SUCCESS) {
++		printf("TEEC_AllocateSharedMemory failed\n");
++		return max_concurrency;
++	}
++
++	memset(shm.buffer, 0, shm.size);
++	max_concurrency = 0;
++	concurrency = 0;
++
++	arg = (struct test_1013_thread_arg *)malloc(sizeof(struct test_1013_thread_arg) * num_threads);
++	thr = (pthread_t *)malloc(sizeof(pthread_t) * num_threads);
++
++	printf("Busy loop repeat %zu\n", repeat * 3);
++	memset(arg, 0, sizeof(struct test_1013_thread_arg) * num_threads);
++	*mean_concurrency = 0;
++	nt = num_threads;
++
++	for (n = 0; n < nt; n++) {
++		arg[n].uuid = uuid;
++		arg[n].cmd = TA_CONCURRENT_CMD_BUSY_LOOP;
++		arg[n].repeat = repeat * 3;
++		arg[n].shm = &shm;
++		if (pthread_create(thr + n, NULL, test_1013_thread, arg + n) != 0) {
++			printf("thread [%d] create failed!\n", n);
++			nt = n;
++		}
++	}
++
++	for (n = 0; n < nt; n++) {
++		if (pthread_join(thr[n], NULL) != 0) {
++			printf("thread [%d] join failed!\n", n);
++		}
++		// if (arg[n].res == TEEC_ERROR_OUT_OF_MEMORY &&
++		//     !memcmp(uuid, &concurrent_large_ta_uuid, sizeof(*uuid))) {
++		// 	printf("TEEC_ERROR_OUT_OF_MEMORY - ignored\n");
++		// 	skip = true;
++		// 	continue;
++		// }
++		if (arg[n].res != TEEC_SUCCESS) {
++			printf("thread [%d] got an unexpected value: 0x%x = %s, error origin: 0x%x = %s\n",
++				n, arg[n].res, get_result_name(arg[n].res),
++				arg[n].error_orig, get_origin_name(arg[n].error_orig));
++			skip = true;
++			continue;
++		}
++		if (arg[n].max_concurrency > max_concurrency)
++			max_concurrency = arg[n].max_concurrency;
++		concurrency += arg[n].max_concurrency;
++	}
++
++	// if (!skip) {
++	// 	if (max_concurrency < 0 || max_concurrency > nt) {
++	// 		printf("unexpected max_concurrency %d\n", max_concurrency);
++	// 	}
++	// 	*mean_concurrency += max_concurrency;
++	// }
++	*mean_concurrency += concurrency / nt;
++	printf("Busy loop repeat %zu end\n", repeat * 3);
++
++	printf("SHA-256 loop repeat %zu\n", repeat);
++	memset(shm.buffer, 0, shm.size);
++	memset(arg, 0, sizeof(struct test_1013_thread_arg) * num_threads);
++	concurrency = 0;
++	nt = num_threads;
++
++	for (n = 0; n < nt; n++) {
++		arg[n].uuid = uuid;
++		arg[n].cmd = TA_CONCURRENT_CMD_SHA256;
++		arg[n].repeat = repeat;
++		arg[n].shm = &shm;
++		arg[n].in = sha256_in;
++		arg[n].in_len = sizeof(sha256_in);
++		arg[n].out = out;
++		arg[n].out_len = sizeof(out);
++		if (pthread_create(thr + n, NULL, test_1013_thread, arg + n) != 0) {
++			printf("thread [%d] create failed!\n", n);
++			nt = n;
++		}
++	}
++
++	for (n = 0; n < nt; n++) {
++		if (pthread_join(thr[n], NULL) != 0) {
++			printf("thread [%d] join failed!\n", n);
++		}
++		// if (arg[n].res == TEEC_ERROR_OUT_OF_MEMORY &&
++		//     !memcmp(uuid, &concurrent_large_ta_uuid, sizeof(*uuid))) {
++		// 	printf("TEEC_ERROR_OUT_OF_MEMORY - ignored\n");
++		// 	skip = true;
++		// 	continue;
++		// }
++		if (arg[n].res != TEEC_SUCCESS) {
++			printf("thread [%d] got an unexpected value: 0x%x = %s, error origin: 0x%x = %s\n",
++				n, arg[n].res, get_result_name(arg[n].res),
++				arg[n].error_orig, get_origin_name(arg[n].error_orig));
++			skip = true;
++			continue;
++		}
++		if (arg[n].max_concurrency > max_concurrency)
++			max_concurrency = arg[n].max_concurrency;
++		concurrency += arg[n].max_concurrency;
++	}
++	// *mean_concurrency += max_concurrency;
++	*mean_concurrency += concurrency / nt;
++	printf("SHA-256 loop repeat %zu end\n", repeat);
++
++	*mean_concurrency /= 2.0;
++	TEEC_ReleaseSharedMemory(&shm);
++	free(arg);
++	free(thr);
++
++	return max_concurrency;
++}
++
++static void xtest_tee_test_1013()
++{
++	int i = 0;
++	size_t max_concurrency = 0;
++	double mean_concurrency = 0;
++	double concurrency = 0;
++	int nb_loops = 1;
++	size_t repeat = 1000;
++	size_t nt = TEST_1013_THREAD_COUNT;
++
++	printf("[xtest 1013] Input num_thread and repeat: ");
++	scanf("%d %d", &nt, &repeat);
++
++	printf("Using small concurrency TA\n");
++	mean_concurrency = 0;
++	for (i = 0; i < nb_loops; i++) {
++		max_concurrency = xtest_tee_test_1013_single(&concurrency, &concurrent_ta_uuid, nt, repeat);
++		mean_concurrency += concurrency;
++	}
++	mean_concurrency /= nb_loops;
++
++	printf("    Number of parallel threads: %d\n", nt);
++	printf("    Max concurrency: %u\n", max_concurrency);
++	printf("    Mean concurrency: %g\n", mean_concurrency);
++	printf("Using small concurrency TA end\n");
++
++	printf("Using large concurrency TA\n");
++	mean_concurrency = 0;
++	for (i = 0; i < nb_loops; i++) {
++		max_concurrency = xtest_tee_test_1013_single(&concurrency, &concurrent_large_ta_uuid, nt, repeat);
++		mean_concurrency += concurrency;
++	}
++	mean_concurrency /= nb_loops;
++
++	printf("    Number of parallel threads: %d\n", nt);
++	printf("    Max concurrency: %u\n", max_concurrency);
++	printf("    Mean concurrency: %g\n", mean_concurrency);
++	printf("Using large concurrency TA end\n");
++}
++
++
++int main(void)
++{
++	char cmd[20];
++	// printf("_SC_NPROCESSORS_CONF is %d\n", sysconf( _SC_NPROCESSORS_CONF));
++	// printf("_SC_NPROCESSORS_ONLN is %d\n", sysconf(_SC_NPROCESSORS_ONLN));
++
++	// printf("get_nprocs_conf is %d\n", get_nprocs_conf());
++	// printf("get_nprocs is %d\n", get_nprocs());
++
++	xtest_teec_ctx_init();
++
++	// printf("\n\n[1] - test readers concurrency\n[2] - test sha256 concurrency\n[3] - test secure storage concurrency\n[q] - quit\nwaiting for cmd [1/2/3/q]: ");
++	// gets(cmd);
++	// if (strcmp(cmd, "q") == 0) {
++	// } else if (strcmp(cmd, "1") == 0) {
++	// 	xtest_tee_test_1003();
++	// } else if (strcmp(cmd, "2") == 0) {
++	// 	xtest_tee_test_1013();
++	// } else if (strcmp(cmd, "3") == 0) {
++	// 	xtest_tee_test_6016();
++	// }
++
++	xtest_tee_test_1003();
++	// xtest_tee_test_6016();
++
++	xtest_teec_ctx_deinit();
++	return 0;
++}
+diff --git a/perf_concurrency/host/secure_storage.c b/perf_concurrency/host/secure_storage.c
+new file mode 100644
+index 0000000..c5f4d4f
+--- /dev/null
++++ b/perf_concurrency/host/secure_storage.c
+@@ -0,0 +1,773 @@
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++#include <sys/time.h>
++
++#include <tee_client_api.h>
++
++#include "tee_api_defines.h"
++#include "tee_api_defines_extensions.h"
++#include "tee_api_types.h"
++// #include "tee_api_compat.h"
++
++#include "ta_storage.h"
++#include "perf_concurrency.h"
++
++#define PTA_STORAGE_UUID { 0x89cb9c3f, 0xd9d7, 0xfd07, \
++	{ 0x48, 0x33, 0x9a, 0x66, 0x93, 0x86, 0x22, 0x6d } }
++
++const TEEC_UUID storage_ta_uuid = TA_STORAGE_UUID;
++// const TEEC_UUID storage_ta_uuid = PTA_STORAGE_UUID;
++
++static uint8_t file_00[] = {
++		0x00, 0x6E, 0x04, 0x57, 0x08, 0xFB, 0x71, 0x96,
++		0xF0, 0x2E, 0x55, 0x3D, 0x02, 0xC3, 0xA6, 0x92,
++		0xE9, 0xC3, 0xEF, 0x8A, 0xB2, 0x34, 0x53, 0xE6,
++		0xF0, 0x74, 0x9C, 0xD6, 0x36, 0xE7, 0xA8, 0x8E};
++
++static uint8_t file_01[] = {
++		0x01, 0x00};
++
++static uint8_t file_02[] = {
++		0x02, 0x11, 0x02};
++
++static uint8_t file_03[] = {
++		0x03, 0x13, 0x03};
++
++static uint8_t file_04[] = {
++		0x00, 0x01, 0x02};
++
++static uint8_t data_00[] = {
++		0x00, 0x6E, 0x04, 0x57, 0x08, 0xFB, 0x71, 0x96,
++		0x00, 0x2E, 0x55, 0x3D, 0x02, 0xC3, 0xA6, 0x92,
++		0x00, 0xC3, 0xEF, 0x8A, 0xB2, 0x34, 0x53, 0xE6,
++		0x00, 0x74, 0x9C, 0xD6, 0x36, 0xE7, 0xA8, 0x00};
++
++static uint8_t data_01[] = {
++		0x01, 0x6E, 0x04, 0x57, 0x08, 0xFB, 0x71, 0x96,
++		0x01, 0x2E, 0x55, 0x3D, 0x02, 0xC3, 0xA6, 0x92,
++		0x01, 0xC3, 0xEF, 0x8A, 0xB2, 0x34, 0x53, 0xE6,
++		0x01, 0x74, 0x9C, 0xD6, 0x36, 0xE7, 0xA8, 0x01};
++
++static uint8_t data_02[] = {
++		0x02, 0x6E, 0x04, 0x57, 0x08, 0xFB, 0x71, 0x96,
++		0x02, 0x2E, 0x55, 0x3D, 0x02, 0xC3, 0xA6, 0x92,
++		0x02, 0xC3, 0xEF, 0x8A, 0xB2, 0x34, 0x53, 0xE6,
++		0x02, 0x74, 0x9C, 0xD6, 0x36, 0xE7, 0xA8, 0x01};
++
++
++unsigned long calc_us(struct timeval start, struct timeval end) {
++	unsigned long us_cost;
++	us_cost = 1000000 * (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec);
++	return us_cost;
++}
++
++
++
++
++static TEEC_Result fs_open(TEEC_Session *sess, void *id, uint32_t id_size,
++													 uint32_t flags, uint32_t *obj, uint32_t storage_id)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	uint32_t org = 0;
++
++	op.params[0].tmpref.buffer = id;
++	op.params[0].tmpref.size = id_size;
++	op.params[1].value.a = flags;
++	op.params[1].value.b = 0;
++	op.params[2].value.a = storage_id;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
++																	 TEEC_VALUE_INOUT, TEEC_VALUE_INPUT,
++																	 TEEC_NONE);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_OPEN, &op, &org);
++
++	if (res == TEEC_SUCCESS)
++		*obj = op.params[1].value.b;
++
++	return res;
++}
++
++static TEEC_Result fs_create(TEEC_Session *sess, void *id, uint32_t id_size,
++														 uint32_t flags, uint32_t attr, void *data,
++														 uint32_t data_size, uint32_t *obj,
++														 uint32_t storage_id)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	uint32_t org = 0;
++
++	op.params[0].tmpref.buffer = id;
++	op.params[0].tmpref.size = id_size;
++	op.params[1].value.a = flags;
++	op.params[1].value.b = 0;
++	op.params[2].value.a = attr;
++	op.params[2].value.b = storage_id;
++	op.params[3].tmpref.buffer = data;
++	op.params[3].tmpref.size = data_size;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
++																	 TEEC_VALUE_INOUT, TEEC_VALUE_INPUT,
++																	 TEEC_MEMREF_TEMP_INPUT);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_CREATE, &op, &org);
++
++	if (res == TEEC_SUCCESS)
++		*obj = op.params[1].value.b;
++
++	return res;
++}
++
++static TEEC_Result fs_create_overwrite(TEEC_Session *sess, void *id,
++																			 uint32_t id_size, uint32_t storage_id)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	uint32_t org = 0;
++
++	op.params[0].tmpref.buffer = id;
++	op.params[0].tmpref.size = id_size;
++	op.params[1].value.a = storage_id;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
++																	 TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_CREATE_OVERWRITE, &op, &org);
++
++	return res;
++}
++
++static TEEC_Result fs_close(TEEC_Session *sess, uint32_t obj)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_CLOSE, &op, &org);
++}
++
++static TEEC_Result fs_read(TEEC_Session *sess, uint32_t obj, void *data,
++													 uint32_t data_size, uint32_t *count)
++{
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].tmpref.buffer = data;
++	op.params[0].tmpref.size = data_size;
++	op.params[1].value.a = obj;
++	op.params[1].value.b = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT,
++																	 TEEC_VALUE_INOUT, TEEC_NONE,
++																	 TEEC_NONE);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_READ, &op, &org);
++
++	if (res == TEEC_SUCCESS)
++		*count = op.params[1].value.b;
++
++	return res;
++}
++
++static TEEC_Result fs_write(TEEC_Session *sess, uint32_t obj, void *data,
++														uint32_t data_size)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].tmpref.buffer = data;
++	op.params[0].tmpref.size = data_size;
++	op.params[1].value.a = obj;
++	op.params[1].value.b = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
++																	 TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_WRITE, &op, &org);
++}
++
++static TEEC_Result fs_seek(TEEC_Session *sess, uint32_t obj, int32_t offset,
++													 int32_t whence)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++	op.params[0].value.b = *(uint32_t *)&offset;
++	op.params[1].value.a = whence;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_VALUE_INOUT,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_SEEK, &op, &org);
++}
++
++static TEEC_Result fs_unlink(TEEC_Session *sess, uint32_t obj)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_UNLINK, &op, &org);
++}
++
++static TEEC_Result fs_trunc(TEEC_Session *sess, uint32_t obj, uint32_t len)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++	op.params[0].value.b = len;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_TRUNC, &op, &org);
++}
++
++static TEEC_Result fs_rename(TEEC_Session *sess, uint32_t obj, void *id,
++														 uint32_t id_size)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++	op.params[1].tmpref.buffer = id;
++	op.params[1].tmpref.size = id_size;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT,
++																	 TEEC_MEMREF_TEMP_INPUT, TEEC_NONE,
++																	 TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_RENAME, &op, &org);
++}
++
++static TEEC_Result fs_alloc_enum(TEEC_Session *sess, uint32_t *e)
++{
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_OUTPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_ALLOC_ENUM, &op, &org);
++
++	if (res == TEEC_SUCCESS)
++		*e = op.params[0].value.a;
++
++	return res;
++}
++
++static TEEC_Result fs_reset_enum(TEEC_Session *sess, uint32_t e)
++{
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	op.params[0].value.a = e;
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_RESET_ENUM, &op, &org);
++
++	return res;
++}
++
++static TEEC_Result fs_free_enum(TEEC_Session *sess, uint32_t e)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE, TEEC_NONE,
++																	 TEEC_NONE);
++
++	op.params[0].value.a = e;
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_FREE_ENUM, &op, &org);
++}
++
++static TEEC_Result fs_start_enum(TEEC_Session *sess, uint32_t e,
++																 uint32_t storage_id)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	op.params[0].value.a = e;
++	op.params[0].value.b = storage_id;
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_START_ENUM, &op, &org);
++}
++
++static TEEC_Result fs_next_enum(TEEC_Session *sess, uint32_t e, void *obj_info,
++																size_t info_size, void *id, uint32_t id_size)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_MEMREF_TEMP_OUTPUT, TEEC_NONE);
++	if (obj_info && info_size)
++		op.paramTypes |= (TEEC_MEMREF_TEMP_OUTPUT << 4);
++
++	op.params[0].value.a = e;
++	op.params[1].tmpref.buffer = obj_info;
++	op.params[1].tmpref.size = info_size;
++	op.params[2].tmpref.buffer = id;
++	op.params[2].tmpref.size = id_size;
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_NEXT_ENUM, &op, &org);
++}
++
++static TEEC_Result fs_restrict_usage(TEEC_Session *sess, uint32_t obj,
++																		 uint32_t obj_usage)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++	op.params[0].value.b = obj_usage;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_RESTRICT_USAGE,
++														&op, &org);
++}
++
++static TEEC_Result fs_alloc_obj(TEEC_Session *sess, uint32_t obj_type,
++																uint32_t max_key_size, uint32_t *obj)
++{
++	TEEC_Result res = TEEC_ERROR_GENERIC;
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj_type;
++	op.params[0].value.b = max_key_size;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_VALUE_OUTPUT,
++																	 TEEC_NONE, TEEC_NONE);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_ALLOC_OBJ, &op, &org);
++	*obj = op.params[1].value.a;
++	return res;
++}
++
++static TEEC_Result fs_free_obj(TEEC_Session *sess, uint32_t obj)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_FREE_OBJ, &op, &org);
++}
++
++static TEEC_Result fs_reset_obj(TEEC_Session *sess, uint32_t obj)
++{
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	uint32_t org = 0;
++
++	op.params[0].value.a = obj;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
++																	 TEEC_NONE, TEEC_NONE);
++
++	return TEEC_InvokeCommand(sess, TA_STORAGE_CMD_RESET_OBJ, &op, &org);
++}
++
++static TEEC_Result fs_get_obj_info(TEEC_Session *sess, uint32_t obj,
++																	 TEE_ObjectInfo *obj_info)
++{
++	TEEC_Result res = TEEC_SUCCESS;
++	TEEC_Operation op = TEEC_OPERATION_INITIALIZER;
++	struct ta_storage_obj_info oi = {};
++	uint32_t org = 0;
++
++	op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT,
++																	 TEEC_MEMREF_TEMP_OUTPUT,
++																	 TEEC_NONE, TEEC_NONE);
++
++	op.params[0].value.a = obj;
++	op.params[1].tmpref.buffer = &oi;
++	op.params[1].tmpref.size = sizeof(oi);
++
++	res = TEEC_InvokeCommand(sess, TA_STORAGE_CMD_GET_OBJ_INFO, &op, &org);
++	if (!res)
++	{
++		obj_info->objectType = oi.object_type;
++		obj_info->objectSize = oi.object_size;
++		obj_info->maxObjectSize = oi.max_object_size;
++		obj_info->objectUsage = oi.object_usage;
++		obj_info->dataSize = oi.data_size;
++		obj_info->dataPosition = oi.data_position;
++		obj_info->handleFlags = oi.handle_flags;
++	}
++
++	return res;
++}
++
++/* Record availability of all secure storage types at runtime */
++struct storage_info
++{
++	uint32_t id;
++	bool available;
++};
++
++static struct storage_info storage_info[] = {
++		{.id = TEE_STORAGE_PRIVATE},
++		{.id = TEE_STORAGE_PRIVATE_REE},
++		{.id = TEE_STORAGE_PRIVATE_RPMB},
++};
++
++static TEEC_Result check_storage_available(uint32_t id, bool *avail)
++{
++	TEE_Result res = TEEC_SUCCESS;
++	TEEC_Session sess = {};
++	uint32_t obj = 0;
++	uint32_t orig = 0;
++	char name[] = "xtest_storage_test";
++
++	res = xtest_teec_open_session(&sess, &storage_ta_uuid, NULL, &orig);
++	if (res != TEEC_SUCCESS)
++		return res;
++
++	res = fs_create(&sess, name, sizeof(name), TEE_DATA_FLAG_ACCESS_WRITE | TEE_DATA_FLAG_ACCESS_READ | TEE_DATA_FLAG_ACCESS_WRITE_META, 0, NULL, 0, &obj, id);
++	switch (res)
++	{
++	case TEEC_SUCCESS:
++		*avail = true;
++		fs_unlink(&sess, obj);
++		break;
++	case TEE_ERROR_ITEM_NOT_FOUND:
++	case TEE_ERROR_STORAGE_NOT_AVAILABLE:
++	case TEE_ERROR_STORAGE_NOT_AVAILABLE_2:
++		*avail = false;
++		res = TEEC_SUCCESS;
++		break;
++	default:
++		res = TEE_ERROR_GENERIC;
++		break;
++	}
++
++	TEEC_CloseSession(&sess);
++
++	return res;
++}
++
++static TEE_Result init_storage_info(void)
++{
++	TEE_Result res = TEE_SUCCESS;
++	static bool done = false;
++	size_t i = 0;
++
++	if (done)
++		return TEE_SUCCESS;
++
++	for (i = 0; i < ARRAY_SIZE(storage_info); i++)
++	{
++		res = check_storage_available(storage_info[i].id,
++																	&storage_info[i].available);
++		if (res)
++			return res;
++	}
++	done = true;
++	return TEE_SUCCESS;
++}
++
++static bool is_storage_available(uint32_t id)
++{
++	size_t i = 0;
++
++	if (init_storage_info())
++		return false;
++
++	for (i = 0; i < ARRAY_SIZE(storage_info); i++)
++	{
++		if (id == storage_info[i].id)
++			return storage_info[i].available;
++	}
++	return false;
++}
++
++#ifndef TEE_STORAGE_ILLEGAL_VALUE
++/* GP TEE Internal Core API >= 1.2 table 5-2 */
++#define TEE_STORAGE_ILLEGAL_VALUE 0x7FFFFFFF
++#endif
++
++static uint32_t fs_id_for_tee_storage_private(void)
++{
++	/*
++	 * Assumes that REE FS is preferred over RPMB FS at compile time in
++	 * optee_os
++	 */
++	if (is_storage_available(TEE_STORAGE_PRIVATE_REE))
++		return TEE_STORAGE_PRIVATE_REE;
++	if (is_storage_available(TEE_STORAGE_PRIVATE_RPMB))
++		return TEE_STORAGE_PRIVATE_RPMB;
++
++	return TEE_STORAGE_ILLEGAL_VALUE;
++}
++
++static uint32_t real_id_for(uint32_t id)
++{
++	if (id == TEE_STORAGE_PRIVATE)
++		return fs_id_for_tee_storage_private();
++	return id;
++}
++
++static bool storage_is(uint32_t id1, uint32_t id2)
++{
++	return (real_id_for(id1) == real_id_for(id2));
++}
++
++
++
++static void *test_6016_thread(void *arg)
++{
++	struct test_6016_thread_arg *a = arg;
++	TEEC_Session sess = a->session;
++	// TEEC_Session sess = *(a->pSession);
++	uint32_t obj = 0;
++	uint32_t count = 0;
++	size_t num_blocks = 1;
++	struct timeval start, end;
++	unsigned long us_cost;
++
++	/* create */
++	a->res = fs_create(&sess, a->file_name, sizeof(a->file_name),
++										 TEE_DATA_FLAG_ACCESS_WRITE, 0, data_00,
++										 sizeof(data_00), &obj, a->storage_id);
++	if (a->res != TEEC_SUCCESS)
++	{
++		printf("fs_create failed\n");
++		goto exit;
++	}
++
++	// a->res = fs_close(&sess, obj);
++	// if (a->res != TEEC_SUCCESS)
++	// {
++	// 	printf("fs_close 1 failed\n");
++	// 	goto exit;
++	// }
++
++	// /* write new data */
++	// a->res = fs_open(&sess, a->file_name, sizeof(a->file_name),
++	// 								 TEE_DATA_FLAG_ACCESS_WRITE, &obj, a->storage_id);
++	// if (a->res != TEEC_SUCCESS)
++	// {
++	// 	printf("fs_open 1 failed\n");
++	// 	goto exit;
++	// }
++
++	// write data block
++	for (int i = 0; i < num_blocks; i++) {
++		memset(a->data, i, a->data_len);
++
++		gettimeofday(&start, NULL);
++		a->res = fs_write(&sess, obj, a->data, a->data_len);
++		gettimeofday(&end, NULL);
++		if (a->res != TEEC_SUCCESS)
++		{
++			printf("fs_write failed\n");
++			goto exit;
++		}
++		a->write_bytes += a->data_len;
++		a->write_us += calc_us(start, end);
++	}
++
++	a->res = fs_close(&sess, obj);
++	if (a->res != TEEC_SUCCESS)
++	{
++		printf("fs_close 2 failed\n");
++		goto exit;
++	}
++
++	a->res = fs_open(&sess, a->file_name, sizeof(a->file_name),
++									 TEE_DATA_FLAG_ACCESS_READ |
++											 TEE_DATA_FLAG_ACCESS_WRITE_META,
++									 &obj, a->storage_id);
++	if (a->res != TEEC_SUCCESS)
++	{
++		printf("fs_open 2 failed\n");
++		goto exit;
++	}
++
++	// read data block
++	for (int i = 0; i < num_blocks; i++) {
++		uint8_t br[a->data_len];
++		uint32_t count = 0;
++
++		memset(br, 0, sizeof(br));
++		memset(a->data, i, a->data_len);
++
++		gettimeofday(&start, NULL);
++		a->res = fs_read(&sess, obj, br, a->data_len, &count);
++		gettimeofday(&end, NULL);
++		if (a->res != TEEC_SUCCESS)
++		{
++			printf("fs_read failed\n");
++			goto exit;
++		}
++		a->read_bytes += count;
++		a->read_us += calc_us(start, end);
++		
++		if (a->data_len != count || memcmp(a->data, br, count) != 0)
++		{
++			printf("got unexpected fs_read output\n");
++		}
++	}
++
++	/* clean */
++	a->res = fs_unlink(&sess, obj);
++	if (a->res != TEEC_SUCCESS)
++	{
++		printf("fs_unlink failed\n");
++		goto exit;
++	}
++
++exit:
++	return NULL;
++}
++
++/* concurency */
++void xtest_tee_test_6016()
++{
++	uint32_t orig = 0;
++	size_t i = 0;
++	size_t n = 0;
++	size_t m = 0;
++	TEEC_Session session;
++	TEEC_Result res;
++	struct test_6016_thread_arg *arg;
++	pthread_t *thr;
++	size_t read_bytes = 0;
++	size_t write_bytes = 0;
++	uint64_t read_us = 0;
++	uint64_t write_us = 0;
++	size_t conflict = 0;
++	size_t data_size = 4 * 1024;
++
++	int k = 0;
++	int nt = 4;
++	int loops = 8;
++
++	printf("[xtest 6016] Input data_size, num_thread and repeat: ");
++	scanf("%d %d %d", &data_size, &nt, &loops);
++
++	printf("    threads: %d, loops: %d\n", nt, loops);
++
++	if (loops <= 0 || nt <= 0)
++	{
++		printf("invalid thread num %d\n", nt);
++		return;
++	}
++
++	arg = (struct test_1013_thread_arg *)malloc(sizeof(struct test_6016_thread_arg) * nt);
++	thr = (pthread_t *)malloc(sizeof(pthread_t) * nt);
++
++	res = xtest_teec_open_session(&session,
++																&storage_ta_uuid, NULL, &orig);
++	if (res != TEEC_SUCCESS)
++	{
++		printf("xtest_teec_open_session failed: res 0x%x\n", res);
++		goto out;
++	}
++
++	for (m = 0; m < nt; m++)
++		if (xtest_teec_open_session(&arg[m].session,
++																&storage_ta_uuid, NULL, &orig) != TEEC_SUCCESS)
++		{
++			printf("xtest_teec_open_session failed\n");
++			goto out;
++		}
++
++	for (k = 0; k < loops; k++)
++	{
++		for (n = 0; n < nt; n++)
++		{
++			arg[n].data = (uint8_t *)malloc(data_size);
++			arg[n].data_len = data_size;
++			arg[n].pSession = &session;
++			arg[n].read_bytes = 0;
++			arg[n].write_bytes = 0;
++			arg[n].read_us = 0;
++			arg[n].write_us = 0;
++			arg[n].storage_id = TEE_STORAGE_PRIVATE;
++			snprintf(arg[n].file_name, sizeof(arg[n].file_name),
++							 "file_%zu", n);
++			if (pthread_create(thr + n, NULL, test_6016_thread, arg + n) != 0)
++			{
++				printf("pthread_create failed\n");
++				nt = n;
++			}
++		}
++
++		for (i = 0; i < n; i++)
++		{
++			if (pthread_join(thr[i], NULL) != 0)
++			{
++				printf("pthread_join failed\n");
++			}
++			if (arg[i].res != TEEC_SUCCESS)
++			{
++				printf("thread [%d] got an unexpected value: 0x%x = %s, error origin: 0x%x = %s\n",
++							 i, arg[i].res, get_result_name(arg[i].res),
++							 arg[i].error_orig, get_origin_name(arg[i].error_orig));
++				if (arg[i].res == TEEC_ERROR_ACCESS_CONFLICT) {
++					conflict += 1;
++				}
++			}
++			read_bytes += arg[i].read_bytes;
++			write_bytes += arg[i].write_bytes;
++			read_us += arg[i].read_us;
++			write_us += arg[i].write_us;
++			free(arg[i].data);
++		}
++	}
++
++	for (i = 0; i < m; i++)
++		TEEC_CloseSession(&arg[i].session);
++	// TEEC_CloseSession(&session);
++
++out:
++	free(arg);
++	free(thr);
++
++	printf("    read: %.3f kB / %.3f ms = %.3f kB/s\n    write: %.3f kB / %.3f ms = %.3f kB/s\n    thread conflicts: %lu\n", read_bytes / 1024.0, read_us / 1000.0, (float)read_bytes * 1000000 / 1024 / read_us, write_bytes / 1024.0, write_us / 1000.0, (float)write_bytes * 1000000 / 1024 / write_us, conflict);
++}
++
++/* concurency */
++// void xtest_tee_test_6016()
++// {
++// 	int i = 0;
++// 	int nt = 3;
++// 	int loops = 8;
++
++// 	printf("[xtest 6016] Input num_thread and repeat: ");
++// 	scanf("%d %d", &nt, &loops);
++
++// 	printf("    threads: %d, loops: %d\n", nt, loops);
++// 	for (i = 0; i < loops; i++)
++// 		xtest_tee_test_6016_loop(nt);
++// }
+\ No newline at end of file
 diff --git a/shared_mem/Android.mk b/shared_mem/Android.mk
 new file mode 100644
 index 0000000..11817a5
@@ -1840,10 +5450,10 @@ index 0000000..ef99069
 +	$(CC) $(CFLAGS) -c $< -o $@
 diff --git a/shared_mem/host/main.c b/shared_mem/host/main.c
 new file mode 100644
-index 0000000..d6e295e
+index 0000000..d0323d0
 --- /dev/null
 +++ b/shared_mem/host/main.c
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,928 @@
 +#include <fcntl.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -1867,6 +5477,7 @@ index 0000000..d6e295e
 + * From arch/arm64/include/uapi/asm/hwcap.h
 + */
 +#define HWCAP2_MTE              (1 << 18)
++#define AT_HWCAP2 26	/* extension of AT_HWCAP */
 +
 +/*
 + * From arch/arm64/include/uapi/asm/mman.h
@@ -1887,21 +5498,29 @@ index 0000000..d6e295e
 +#define PR_MTE_TAG_SHIFT       3
 +#define PR_MTE_TAG_MASK        (0xffffUL << PR_MTE_TAG_SHIFT)
 +
++#ifdef CONFIG_KASAN_HW_TAGS
 +/*
 + * Insert a random logical tag into the given pointer.
 + */
-+#define insert_random_tag(ptr) ({                       \
-+        uint64_t __val;                                 \
-+        asm("irg %0, %1" : "=r" (__val) : "r" (ptr));   \
-+        __val;                                          \
-+})
++#define insert_random_tag(ptr)                  \
++	({                                            \
++		uint64_t __val;                             \
++		asm("irg %0, %1" : "=r"(__val) : "r"(ptr)); \
++		__val;                                      \
++	})
 +
 +/*
 + * Set the allocation tag on the destination address.
 + */
-+#define set_tag(tagged_addr) do {                                      \
-+        asm volatile("stg %0, [%0]" : : "r" (tagged_addr) : "memory"); \
++#define set_tag(tagged_addr) do {                                \
++	uaccess_enable_privileged();                                   \
++	asm volatile("stg %0, [%0]" : : "r" (tagged_addr) : "memory"); \
++	uaccess_disable_privileged();                                  \
 +} while (0)
++#else
++#define insert_random_tag(ptr) (ptr)
++#define set_tag(tagged_addr)
++#endif
 +
 +#define rounddown(x) ((x) & ~(0xffful))
 +#define roundup(x) (((x) + 0xffful) & ~(0xffful))
@@ -1930,7 +5549,7 @@ index 0000000..d6e295e
 +	return us_cost;
 +}
 +
-+void parallel_invoke_command(thread_args_t *args) {
++void fun_invoke_ta(thread_args_t *args) {
 +	TEEC_Result res;
 +	TEEC_Operation *op = args->op;
 +	TEEC_Session *sess = args->sess;
@@ -1950,7 +5569,7 @@ index 0000000..d6e295e
 +	printf("TA incremented buf[0] to: %u\n", ((uint8_t *)((*shared_mem).buffer))[0]);
 +}
 +
-+void parallel_increment_ca(thread_args_t *args) {
++void fun_client_access(thread_args_t *args) {
 +	printf("Incrementing buf[0] in CA\n");
 +	if (! args->is_sequential) {
 +		printf("Expecting SIGSEGV...\n");
@@ -2033,8 +5652,8 @@ index 0000000..d6e295e
 +		.size = size,
 +		.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT
 +	};
-+	parallel_invoke_command((void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin}));
-+	parallel_increment_ca((void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 1}));
++	fun_invoke_ta((void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin}));
++	fun_client_access((void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 1}));
 +
 +	/*
 +	 * We're done with the TA, close the session and
@@ -2140,12 +5759,12 @@ index 0000000..d6e295e
 +		.size = size,
 +		.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT
 +	};
-+	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[0], NULL, (void *)fun_invoke_ta, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	// wait for the TA command invocation
 +	msleep(100);
 +
-+	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[1], NULL, (void *)fun_client_access, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	// we should finish with a segmentation fault if luck is on our side
 +	// since the thread[1] is trying to write to a inaccessible memory
@@ -2252,14 +5871,14 @@ index 0000000..d6e295e
 +	// ((uint8_t *)shared_mem.buffer)[0]++;
 +	// printf("buf[0] is now: %d\n", ((uint8_t *)shared_mem.buffer)[0]);
 +
-+	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[0], NULL, (void *)fun_invoke_ta, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	// wait for the TA command invocation
 +	msleep(100);
 +
 +	// we should finish with a segmentation fault if luck is on our side
 +	// since the thread[1] is trying to write to a inaccessible memory
-+	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[1], NULL, (void *)fun_client_access, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	pthread_join(threads[0], NULL);
 +	pthread_join(threads[1], NULL);
@@ -2358,14 +5977,14 @@ index 0000000..d6e295e
 +																	 TEEC_NONE, TEEC_NONE);
 +	op.params[0].memref.parent = &shared_mem;
 +
-+	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[0], NULL, (void *)fun_invoke_ta, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	// wait for the TA command invocation
 +	msleep(100);
 +
 +	// we should finish with a segmentation fault if luck is on our side
 +	// since the thread[1] is trying to write to a inaccessible memory
-+	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[1], NULL, (void *)fun_client_access, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	pthread_join(threads[0], NULL);
 +	pthread_join(threads[1], NULL);
@@ -2459,14 +6078,14 @@ index 0000000..d6e295e
 +		.size = size,
 +		.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT
 +	};
-+	pthread_create(&threads[0], NULL, (void *)parallel_invoke_command, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[0], NULL, (void *)fun_invoke_ta, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	// wait for the TA command invocation
 +	msleep(100);
 +
 +	// we should finish with a segmentation fault if luck is on our side
 +	// since the thread[1] is trying to write to a inaccessible memory
-+	pthread_create(&threads[1], NULL, (void *)parallel_increment_ca, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
++	pthread_create(&threads[1], NULL, (void *)fun_client_access, (void *)(&(thread_args_t){&op, &sess, &shared_mem, &err_origin, 0}));
 +
 +	pthread_join(threads[0], NULL);
 +	pthread_join(threads[1], NULL);
@@ -2482,11 +6101,31 @@ index 0000000..d6e295e
 +{
 +	unsigned char *a;
 +	unsigned long page_sz = sysconf(_SC_PAGESIZE) * 2;
-+	// unsigned long hwcap2 = getauxval(AT_HWCAP2);
++	unsigned long hwcap2 = getauxval(AT_HWCAP2);
 +
 +	// /* check if MTE is present */
-+	// if (!(hwcap2 & HWCAP2_MTE))
-+	// 	return EXIT_FAILURE;
++	if (!(hwcap2 & HWCAP2_MTE)) {
++		printf("MTE not supported\n");
++		return EXIT_FAILURE;
++	}
++
++#ifdef CONFIG_ARM64_MTE
++	printf("CONFIG_ARM64_MTE = y\n");
++#else
++	printf("CONFIG_ARM64_MTE = n\n");
++#endif
++
++#ifdef CONFIG_ARM64_AS_HAS_MTE
++	printf("CONFIG_ARM64_AS_HAS_MTE = y\n");
++#else
++	printf("CONFIG_ARM64_AS_HAS_MTE = n\n");
++#endif
++
++#ifdef CONFIG_KASAN_HW_TAGS
++	printf("CONFIG_KASAN_HW_TAGS = y\n");
++#else
++	printf("CONFIG_KASAN_HW_TAGS = n\n");
++#endif
 +
 +	/*
 +	 * Enable the tagged address ABI, synchronous or asynchronous MTE
@@ -2533,7 +6172,7 @@ index 0000000..d6e295e
 +	printf("a[0] = %hhu a[1] = %hhu\n", a[0], a[1]);
 +
 +	/* set the logical and allocation tags */
-+	a = (unsigned char *)insert_random_tag(a);
++	a = (unsigned char *)(a);
 +	set_tag(a);
 +
 +	printf("buffer: %p (%lu)\n", a, page_sz);
@@ -2714,12 +6353,15 @@ index 0000000..d6e295e
 +int main(void)
 +{
 +	char cmd[20];
++	unsigned long hwcap2 = getauxval(AT_HWCAP2);
 +
-+	int res = prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | PR_MTE_TCF_ASYNC | (0xfffe << PR_MTE_TAG_SHIFT), 0, 0, 0);
-+	// printf("prctl res: %d\n", res);
++	if ((hwcap2 & HWCAP2_MTE)) {
++		int res = prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | PR_MTE_TCF_ASYNC | (0xfffe << PR_MTE_TAG_SHIFT), 0, 0, 0);
++		// printf("prctl res: %d\n", res);
++	}
 +
 +	while (1) {
-+		printf("\n\n[0] - test mte\n[1] - test tmpref sequential\n[2] - test tmpref parallel\n[3] - test tmpref piece\n[4] - test memref allocation\n[5] - test memref register\n[6] - test performance\n[q] - quit\nwaiting for cmd [0/1/2/3/4/5/6/q]: ");
++		printf("\n[1] - test tmpref sequentially\n[2] - test tmpref concurrently\n[3] - test allocated memref\n[4] - test registered memref\n[5] - evaluate performance\n[q] - quit\nwaiting for cmd [1/2/3/4/5/q]: ");
 +		gets(cmd);
 +		if (strcmp(cmd, "q") == 0) {
 +			break;
@@ -2730,12 +6372,10 @@ index 0000000..d6e295e
 +		} else if (strcmp(cmd, "2") == 0) {
 +			test_tmpref_par();
 +		} else if (strcmp(cmd, "3") == 0) {
-+			test_tmpref_piece();
-+		} else if (strcmp(cmd, "4") == 0) {
 +			test_memref_alloc();
-+		} else if (strcmp(cmd, "5") == 0) {
++		} else if (strcmp(cmd, "4") == 0) {
 +			test_memref_reg();
-+		} else if (strcmp(cmd, "6") == 0) {
++		} else if (strcmp(cmd, "5") == 0) {
 +			test_performance();
 +		}
 +	}

@@ -1,3 +1,18 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 000000000000..8eb0091da53a
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,9 @@
++# linux
++
++Linux kernel source tree
++
++## Build
++Build with `KCFLAGS` environment variable and `MEMTAG` argument to enable MTE:
++```
++KCFLAGS="-march=armv8.5-a+memtag" make MEMTAG=y run -j$(nproc)
++```
 diff --git a/arch/arm64/include/asm/arm_pmuv3.h b/arch/arm64/include/asm/arm_pmuv3.h
 index 18dc2fb3d7b7..38021773594a 100644
 --- a/arch/arm64/include/asm/arm_pmuv3.h
@@ -29,21 +44,23 @@ index 18dc2fb3d7b7..38021773594a 100644
 +
  #endif
 diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
-index 14be5000c5a0..91a1803fbc82 100644
+index 14be5000c5a0..37b31c4ef6c8 100644
 --- a/arch/arm64/include/asm/uaccess.h
 +++ b/arch/arm64/include/asm/uaccess.h
-@@ -425,4 +425,32 @@ static inline size_t probe_subpage_writeable(const char __user *uaddr,
+@@ -425,4 +425,40 @@ static inline size_t probe_subpage_writeable(const char __user *uaddr,
  
  #endif /* CONFIG_ARCH_HAS_SUBPAGE_FAULTS */
  
++#ifdef CONFIG_ARM64_AS_HAS_MTE
 +/*
 + * Insert a random logical tag into the given pointer.
 + */
-+#define insert_random_tag(ptr) ({                       \
-+        uint64_t __val;                                 \
-+        asm("irg %0, %1" : "=r" (__val) : "r" (ptr));   \
-+        __val;                                          \
-+})
++#define insert_random_tag(ptr)                  \
++	({                                            \
++		uint64_t __val;                             \
++		asm("irg %0, %1" : "=r"(__val) : "r"(ptr)); \
++		__val;                                      \
++	})
 +
 +/*
 + * Set the allocation tag on the destination address.
@@ -63,10 +80,16 @@ index 14be5000c5a0..91a1803fbc82 100644
 + * Clear the tag on the given pointer.
 + */
 +#define clear_tag(tagged_addr) ((tagged_addr) & ~(0xful << 56))
++#else
++#define insert_random_tag(ptr) (ptr)
++#define set_tag(tagged_addr)
++#define get_tag(tagged_addr) ((tagged_addr) & (0xful << 56))
++#define clear_tag(tagged_addr)
++#endif /* CONFIG_ARM64_AS_HAS_MTE */
 +
  #endif /* __ASM_UACCESS_H */
 diff --git a/drivers/tee/tee_core.c b/drivers/tee/tee_core.c
-index 91932835d0f7..99fe24fbd424 100644
+index 91932835d0f7..5e5a49a6ac1d 100644
 --- a/drivers/tee/tee_core.c
 +++ b/drivers/tee/tee_core.c
 @@ -9,12 +9,21 @@
@@ -100,7 +123,7 @@ index 91932835d0f7..99fe24fbd424 100644
  /*
   * TEE Client UUID name space identifier (UUIDv4)
   *
-@@ -540,6 +551,371 @@ static int tee_ioctl_open_session(struct tee_context *ctx,
+@@ -540,6 +551,369 @@ static int tee_ioctl_open_session(struct tee_context *ctx,
  	return rc;
  }
  
@@ -334,61 +357,59 @@ index 91932835d0f7..99fe24fbd424 100644
 +
 +static void set_buffer_tag(unsigned long addr, size_t size) {
 +	size_t granule_num;
-+	unsigned long start, end, tagged_start;
++	unsigned long page_start, page_end, mte_start, mte_end, tagged_start;
 +
-+	// set page attribute with PROT_MTE
-+	start = rounddown(addr, PAGE_SIZE);
-+	end = roundup(addr + size, PAGE_SIZE);
-+	do_mprotect(start, end - start, PROT_READ | PROT_WRITE | PROT_MTE);
-+	// printk("[set_buffer_tag] mprotect on buffer %#lx (%#x)\n", start, end - start);
++	page_start = rounddown(addr, PAGE_SIZE);
++	page_end = roundup(addr + size, PAGE_SIZE);
 +
-+	// set memory tag
-+	start = roundup(addr, MTE_GRANULE_SIZE);
-+	end = rounddown(addr + size, MTE_GRANULE_SIZE);
-+	granule_num = (end - start) / MTE_GRANULE_SIZE;
-+	// MOD: fix the case where the difference is less than 8
-+	if (end <= start) {
++	mte_start = roundup(addr, MTE_GRANULE_SIZE);
++	mte_end = rounddown(addr + size, MTE_GRANULE_SIZE);
++	granule_num = (mte_end - mte_start) / MTE_GRANULE_SIZE;
++
++	if (mte_end <= mte_start) {
 +		return;
 +	}
 +
++	// set page attribute with PROT_MTE
++	do_mprotect(page_start, page_end - page_start, PROT_READ | PROT_WRITE | PROT_MTE);
++	// printk("[set_buffer_tag] mprotect on buffer %#lx (%#x)\n", page_start, page_end - page_start);
++
 +	/* set the logical and allocation tags */
-+	tagged_start = insert_random_tag(start);
-+	// printk("[set_buffer_tag] about to set tag on buffer %#lx (%#x),  %#lx (%#x) \n",
-+	    //    addr, size, tagged_start, granule_num);
++	tagged_start = insert_random_tag(mte_start);
++	// set memory tag
 +	for (size_t n = 0; n < granule_num; n++) {
 +		set_tag(tagged_start + n * MTE_GRANULE_SIZE);
 +	}
-+
 +	// printk("[set_buffer_tag] set tag on buffer %#lx (%#x),  %#lx (%#x) \n",
-+	    //    addr, size, tagged_start, granule_num);
++	//        addr, size, tagged_start, granule_num);
 +}
 +
 +static void clear_buffer_tag(unsigned long addr, size_t size) {
 +	size_t granule_num;
-+	unsigned long start, end, untagged_start, tag;
++	unsigned long page_start, page_end, mte_start, mte_end, tag, untagged_start;
 +
-+	// set page attribute without PROT_MTE
-+	start = rounddown(addr, PAGE_SIZE);
-+	end = roundup(addr + size, PAGE_SIZE);
-+	do_mprotect(start, end - start, PROT_READ | PROT_WRITE);
-+	// printk("[clear_buffer_tag] mprotect on buffer %#lx (%#x)\n", start, end-start);
++	page_start = rounddown(addr, PAGE_SIZE);
++	page_end = roundup(addr + size, PAGE_SIZE);
 +
-+	start = roundup(addr, MTE_GRANULE_SIZE);
-+	end = rounddown(addr + size, MTE_GRANULE_SIZE);
-+	granule_num = (end - start) / MTE_GRANULE_SIZE;
-+	// MOD: fix the case where the difference is less than 8
-+	if (end <= start) {
++	mte_start = roundup(addr, MTE_GRANULE_SIZE);
++	mte_end = rounddown(addr + size, MTE_GRANULE_SIZE);
++	granule_num = (mte_end - mte_start) / MTE_GRANULE_SIZE;
++
++	if (mte_end <= mte_start) {
 +		return;
 +	}
 +
++	// set page attribute without PROT_MTE
++	do_mprotect(page_start, page_end - page_start, PROT_READ | PROT_WRITE);
++	// printk("[clear_buffer_tag] mprotect on buffer %#lx (%#x)\n", page_start, page_end - page_start);
++
 +	/* clear the tag */
-+	tag = get_tag(start);
-+	untagged_start = tag ^ start;
-+	// untagged_start = clear_tag(start);
++	tag = get_tag(mte_start);
++	untagged_start = tag ^ mte_start;
++	// untagged_start = clear_tag(mte_start);
 +	for (size_t n = 0; n < granule_num; n++) {
 +		set_tag(untagged_start + n * MTE_GRANULE_SIZE);
 +	}
-+
 +	// printk("[clear_buffer_tag] clear tag (%lx) on buffer %#lx (%#x),  %#lx (%#x) \n",
 +	//        tag, addr, size, untagged_start, granule_num);
 +}
@@ -432,7 +453,7 @@ index 91932835d0f7..99fe24fbd424 100644
 +	seg2_end = addr + size;
 +
 +	// printk("[set_param_tag_seg] seg1: %#x %#x, seg2:  %#x %#x\n",
-+	    //    seg1_start, seg1_end, seg2_start, seg2_end);
++	//        seg1_start, seg1_end, seg2_start, seg2_end);
 +
 +	if (seg1_end > seg1_start) {
 +		set_buffer_tag(seg1_start, seg1_end - seg1_start);
@@ -458,7 +479,7 @@ index 91932835d0f7..99fe24fbd424 100644
 +	seg2_end = addr + size;
 +
 +	// printk("[clear_param_tag_seg] seg1: %#x %#x, seg2:  %#x %#x\n",
-+	    //    seg1_start, seg1_end, seg2_start, seg2_end);
++	//        seg1_start, seg1_end, seg2_start, seg2_end);
 +
 +	if (seg1_end > seg1_start) {
 +		clear_buffer_tag(seg1_start, seg1_end - seg1_start);
@@ -472,7 +493,7 @@ index 91932835d0f7..99fe24fbd424 100644
  static int tee_ioctl_invoke(struct tee_context *ctx,
  			    struct tee_ioctl_buf_data __user *ubuf)
  {
-@@ -550,6 +926,7 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
+@@ -550,6 +924,7 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
  	struct tee_ioctl_invoke_arg arg;
  	struct tee_ioctl_param __user *uparams = NULL;
  	struct tee_param *params = NULL;
@@ -480,7 +501,7 @@ index 91932835d0f7..99fe24fbd424 100644
  
  	if (!ctx->teedev->desc->ops->invoke_func)
  		return -EINVAL;
-@@ -577,7 +954,45 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
+@@ -577,8 +952,46 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
  		rc = params_from_user(ctx, params, arg.num_params, uparams);
  		if (rc)
  			goto out;
@@ -493,8 +514,8 @@ index 91932835d0f7..99fe24fbd424 100644
 +		}
 +		// MOD: store params prot of memref type
 +		store_param_prot(params, params_data, arg.num_params);
-+	}
-+
+ 	}
+ 
 +	// u64 cycle_start = ccnt_read();
 +	// MOD: set params of memref type as inaccessible
 +	if (params) {
@@ -519,14 +540,15 @@ index 91932835d0f7..99fe24fbd424 100644
 +			// 	set_param_tag(params[n]);
 +			// }
 +		}
- 	}
++	}
 +	// u64 cycle_end = ccnt_read();
 +	// printk("[tee_ioctl_invoke] set param prot: %lu - %lu = [%lu] cycles\n",
 +	//        cycle_end, cycle_start, cycle_end - cycle_start);
- 
++
  	rc = ctx->teedev->desc->ops->invoke_func(ctx, &arg, params);
  	if (rc)
-@@ -594,10 +1009,42 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
+ 		goto out;
+@@ -594,10 +1007,42 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
  		/* Decrease ref count for all valid shared memory pointers */
  		for (n = 0; n < arg.num_params; n++)
  			if (tee_param_is_memref(params + n) &&
@@ -611,7 +633,7 @@ index bf5d0b1b16f4..1649243cbda0 100644
  /*
   * doesn't attempt to fault and will return short.
 diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
-index 911ddf92dcee..ce14bacfe4a9 100644
+index 911ddf92dcee..d272c9bbda8b 100644
 --- a/include/linux/tee_drv.h
 +++ b/include/linux/tee_drv.h
 @@ -77,6 +77,15 @@ struct tee_param {
