@@ -22,9 +22,9 @@ The artifact of the *Freesia paper* includes the source code of *Freesia* protot
 The environment can be a physical or virtual machine in the following minimal configuration:
 
 - OS: Ubuntu 23.10 with GUI
-- CPU: 4-core AMD EPYC 9654 CPU @ 2.4GHz
-- RAM: 4GB
-- Disk: 30GB
+- CPU: 8-core AMD EPYC 9654 CPU @ 2.4GHz
+- RAM: 8GB
+- Disk: 50GB
 
 Notes:
 
@@ -72,6 +72,11 @@ Unzip the artifact archive and get a directory named *Freesia*.
 # make toolchains -j2
 ```
 
+Add Cargo's bin directory in the PATH environment variable:
+```
+# export PATH="/data/Freesia/Freesia_prototype/build/../toolchains/rust/.cargo/bin:$PATH"
+```
+
 ### 3.5 Apply Freesia pathes
 
 ```
@@ -81,6 +86,12 @@ Unzip the artifact archive and get a directory named *Freesia*.
 
 ### 3.6 Compile and run
 
+To enable build as root:
+```
+# export FORCE_UNSAFE_CONFIGURE=1
+```
+
+Build and run:
 ```
 # cd build
 # KCFLAGS="-march=armv8.5-a+memtag" make MEMTAG=y run -j$(nproc)
