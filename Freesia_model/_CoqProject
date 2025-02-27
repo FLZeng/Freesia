@@ -1,5 +1,6 @@
 -Q ./client client
 -Q ./core/kernel core.kernel
+-Q ./examples examples
 -Q ./lib lib
 -Q ./ta ta
 
@@ -7,7 +8,8 @@ client/tee_client_api.v
 core/kernel/wait_queue.v
 core/kernel/spinlock.v
 core/kernel/mutex.v
-core/kernel/model.v
+examples/example_nested_invariant.v
+examples/example_oneshot_ghost_variable.v
 lib/basic_types.v
 lib/oneshot.v
 ta/heap_vuln.v
