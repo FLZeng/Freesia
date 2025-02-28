@@ -10,7 +10,7 @@ do
     echo "Applying patches for [${project}] ... "
     project_dir="${BASE_DIR}/${project}"
     patch_path="${PATCH_DIR}/${project}.patch"
-    cd ${project_dir} && git restore . && git clean -fd && git apply ${patch_path}
+    cd ${project_dir} && git restore --staged . && git restore . && git clean -fd && git apply ${patch_path}
     if [ $? -eq 0 ]; then
         echo "done"
     else

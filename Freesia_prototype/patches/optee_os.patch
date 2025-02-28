@@ -432,17 +432,37 @@ index 000000000..c5aad8fb6
 +                   .invoke_command_entry_point = invoke_command_entry_point);
 \ No newline at end of file
 diff --git a/core/pta/sub.mk b/core/pta/sub.mk
-index 1cb148a32..71dee8135 100644
+index 1cb148a32..6d7ffa77c 100644
 --- a/core/pta/sub.mk
 +++ b/core/pta/sub.mk
-@@ -14,6 +14,7 @@ srcs-$(CFG_SCMI_PTA) += scmi.c
- srcs-$(CFG_HWRNG_PTA) += hwrng.c
+@@ -15,6 +15,8 @@ srcs-$(CFG_HWRNG_PTA) += hwrng.c
  srcs-$(CFG_RTC_PTA) += rtc.c
  srcs-$(CFG_WIDEVINE_PTA) += widevine.c
+
 +srcs-y += heap_vuln.c
- 
++
  subdirs-y += bcm
  subdirs-y += stm32mp
+ subdirs-y += imx
+diff --git a/core/pta/tests/mutex.c b/core/pta/tests/mutex.c
+index f1020a11f..36e9b43e3 100644
+--- a/core/pta/tests/mutex.c
++++ b/core/pta/tests/mutex.c
+@@ -76,10 +76,10 @@ TEE_Result core_mutex_tests(uint32_t param_types,
+ 					  TEE_PARAM_TYPE_NONE,
+ 					  TEE_PARAM_TYPE_NONE);
+
+-	if (exp_pt != param_types) {
+-		DMSG("bad parameter types");
+-		return TEE_ERROR_BAD_PARAMETERS;
+-	}
++//	if (exp_pt != param_types) {
++//		DMSG("bad parameter types");
++//		return TEE_ERROR_BAD_PARAMETERS;
++//	}
+
+ 	switch (params[0].value.a) {
+ 	case PTA_MUTEX_TEST_WRITER:
 diff --git a/lib/libutee/include/pta_heap_vuln.h b/lib/libutee/include/pta_heap_vuln.h
 new file mode 100644
 index 000000000..8534b6217
@@ -478,15 +498,28 @@ index 000000000..8534b6217
 +
 +#endif /* __PTA_HEAP_VULN_H */
 \ No newline at end of file
+diff --git a/mk/config.mk b/mk/config.mk
+index 8485ea89e..f354cf21f 100644
+--- a/mk/config.mk
++++ b/mk/config.mk
+@@ -110,7 +110,7 @@ CFG_CORE_DUMP_OOM ?= $(CFG_TEE_CORE_MALLOC_DEBUG)
+ CFG_MSG_LONG_PREFIX_MASK ?= 0x1a
+
+ # Number of threads
+-CFG_NUM_THREADS ?= 2
++CFG_NUM_THREADS ?= 4
+
+ # API implementation version
+ CFG_TEE_API_VERSION ?= GPD-1.1-dev
 diff --git a/mk/lib.mk b/mk/lib.mk
-index 315cae250..8d0ac6b5e 100644
+index 315cae250..66bd575fe 100644
 --- a/mk/lib.mk
 +++ b/mk/lib.mk
 @@ -16,6 +16,7 @@
  # updated cleanfiles and
  # updated libfiles, libdirs, libnames and libdeps
- 
-+cppflags$(sm) += -DNDEBUG
- 
+
++cppflags$(sm)  += -DNDEBUG
+
  subdirs = $(libdir)
  include mk/subdir.mk

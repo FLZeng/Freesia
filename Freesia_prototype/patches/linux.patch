@@ -1,26 +1,11 @@
-diff --git a/README.md b/README.md
-new file mode 100644
-index 000000000000..8eb0091da53a
---- /dev/null
-+++ b/README.md
-@@ -0,0 +1,9 @@
-+# linux
-+
-+Linux kernel source tree
-+
-+## Build
-+Build with `KCFLAGS` environment variable and `MEMTAG` argument to enable MTE:
-+```
-+KCFLAGS="-march=armv8.5-a+memtag" make MEMTAG=y run -j$(nproc)
-+```
 diff --git a/arch/arm64/include/asm/arm_pmuv3.h b/arch/arm64/include/asm/arm_pmuv3.h
-index 18dc2fb3d7b7..38021773594a 100644
+index 18dc2fb3d..380217735 100644
 --- a/arch/arm64/include/asm/arm_pmuv3.h
 +++ b/arch/arm64/include/asm/arm_pmuv3.h
 @@ -152,4 +152,25 @@ static inline bool is_pmuv3p5(int pmuver)
  	return pmuver >= ID_AA64DFR0_EL1_PMUVer_V3P5;
  }
- 
+
 +#define arch_counter_enforce_ordering(val) do {				\
 +	unsigned long tmp, _val = (val);						\
 +									\
@@ -44,13 +29,13 @@ index 18dc2fb3d7b7..38021773594a 100644
 +
  #endif
 diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
-index 14be5000c5a0..37b31c4ef6c8 100644
+index 14be5000c..ecc325022 100644
 --- a/arch/arm64/include/asm/uaccess.h
 +++ b/arch/arm64/include/asm/uaccess.h
-@@ -425,4 +425,40 @@ static inline size_t probe_subpage_writeable(const char __user *uaddr,
- 
+@@ -425,4 +425,42 @@ static inline size_t probe_subpage_writeable(const char __user *uaddr,
+
  #endif /* CONFIG_ARCH_HAS_SUBPAGE_FAULTS */
- 
+
 +#ifdef CONFIG_ARM64_AS_HAS_MTE
 +/*
 + * Insert a random logical tag into the given pointer.
@@ -82,14 +67,16 @@ index 14be5000c5a0..37b31c4ef6c8 100644
 +#define clear_tag(tagged_addr) ((tagged_addr) & ~(0xful << 56))
 +#else
 +#define insert_random_tag(ptr) (ptr)
-+#define set_tag(tagged_addr)
++#define set_tag(tagged_addr) do {                                \
++	printk("empty set_tag\n");                                     \
++} while (0)
 +#define get_tag(tagged_addr) ((tagged_addr) & (0xful << 56))
 +#define clear_tag(tagged_addr)
 +#endif /* CONFIG_ARM64_AS_HAS_MTE */
 +
  #endif /* __ASM_UACCESS_H */
 diff --git a/drivers/tee/tee_core.c b/drivers/tee/tee_core.c
-index 91932835d0f7..5e5a49a6ac1d 100644
+index 91932835d..5e5a49a6a 100644
 --- a/drivers/tee/tee_core.c
 +++ b/drivers/tee/tee_core.c
 @@ -9,12 +9,21 @@
@@ -112,12 +99,12 @@ index 91932835d0f7..5e5a49a6ac1d 100644
 +#include <asm/uaccess.h>
 +
  #include "tee_private.h"
- 
+
  #define TEE_NUM_DEVICES	32
 @@ -23,6 +32,8 @@
- 
+
  #define TEE_UUID_NS_NAME_SIZE	128
- 
+
 +#define MTE_GRANULE_SIZE 16
 +
  /*
@@ -126,7 +113,7 @@ index 91932835d0f7..5e5a49a6ac1d 100644
 @@ -540,6 +551,369 @@ static int tee_ioctl_open_session(struct tee_context *ctx,
  	return rc;
  }
- 
+
 +static pte_t *lookup_address(unsigned long addr) {
 +	pgd_t *pgdp;
 +	p4d_t *p4dp;
@@ -498,7 +485,7 @@ index 91932835d0f7..5e5a49a6ac1d 100644
  	struct tee_ioctl_param __user *uparams = NULL;
  	struct tee_param *params = NULL;
 +	struct tee_param_prot_data *params_data = NULL;
- 
+
  	if (!ctx->teedev->desc->ops->invoke_func)
  		return -EINVAL;
 @@ -577,8 +952,46 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
@@ -515,7 +502,7 @@ index 91932835d0f7..5e5a49a6ac1d 100644
 +		// MOD: store params prot of memref type
 +		store_param_prot(params, params_data, arg.num_params);
  	}
- 
+
 +	// u64 cycle_start = ccnt_read();
 +	// MOD: set params of memref type as inaccessible
 +	if (params) {
@@ -591,9 +578,9 @@ index 91932835d0f7..5e5a49a6ac1d 100644
 +	}
  	return rc;
  }
- 
+
 diff --git a/drivers/tee/tee_shm.c b/drivers/tee/tee_shm.c
-index 673cf0359494..3a5eb4a57fc5 100644
+index 673cf0359..3a5eb4a57 100644
 --- a/drivers/tee/tee_shm.c
 +++ b/drivers/tee/tee_shm.c
 @@ -247,6 +247,8 @@ register_shm_helper(struct tee_context *ctx, unsigned long addr,
@@ -606,7 +593,7 @@ index 673cf0359494..3a5eb4a57fc5 100644
  	shm->size = length;
  	num_pages = (roundup(addr + length, PAGE_SIZE) - start) / PAGE_SIZE;
 diff --git a/include/linux/mm.h b/include/linux/mm.h
-index bf5d0b1b16f4..1649243cbda0 100644
+index bf5d0b1b1..1649243cb 100644
 --- a/include/linux/mm.h
 +++ b/include/linux/mm.h
 @@ -448,7 +448,13 @@ extern unsigned int kobjsize(const void *objp);
@@ -620,7 +607,7 @@ index bf5d0b1b16f4..1649243cbda0 100644
 +#else
  #define VM_FLAGS_CLEAR	(ARCH_VM_PKEY_FLAGS | VM_ARCH_CLEAR)
 +#endif
- 
+
  /*
   * mapping from the currently active vm_flags protection bits (the
 @@ -2525,6 +2531,8 @@ extern long change_protection(struct mmu_gather *tlb,
@@ -629,17 +616,17 @@ index bf5d0b1b16f4..1649243cbda0 100644
  	  unsigned long start, unsigned long end, unsigned long newflags);
 +// MOD: add do_mprotect
 +extern int do_mprotect(unsigned long start, size_t len, unsigned long prot);
- 
+
  /*
   * doesn't attempt to fault and will return short.
 diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
-index 911ddf92dcee..d272c9bbda8b 100644
+index 911ddf92d..d272c9bbd 100644
 --- a/include/linux/tee_drv.h
 +++ b/include/linux/tee_drv.h
 @@ -77,6 +77,15 @@ struct tee_param {
  	} u;
  };
- 
+
 +// MOD: add prot
 +struct tee_param_prot_data {
 +	__u64 start;
@@ -667,16 +654,16 @@ index 911ddf92dcee..d272c9bbda8b 100644
 +	// MOD: add addr
 +	unsigned long addr;
  };
- 
+
  /**
 diff --git a/mm/mprotect.c b/mm/mprotect.c
-index b94fbb45d5c7..5eebfe884949 100644
+index b94fbb45d..5eebfe884 100644
 --- a/mm/mprotect.c
 +++ b/mm/mprotect.c
 @@ -834,6 +834,141 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
  	return error;
  }
- 
+
 +int do_mprotect(unsigned long start, size_t len, unsigned long prot)
 +{
 +	unsigned long nstart, end, tmp, reqprot;
