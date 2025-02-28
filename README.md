@@ -94,6 +94,7 @@ To enable build as root:
 Build and run:
 ```
 # cd build
+# make clean
 # KCFLAGS="-march=armv8.5-a+memtag" make MEMTAG=y run -j$(nproc)
 ```
 
