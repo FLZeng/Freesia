@@ -226,12 +226,31 @@ The original data are in `TEE_Concurrency.csv` and averaged in `TEE_Concurrency_
 Run the following command with specific `NUM_THREADS` and `REPEAT` to measure the concurrency under different client threads:
 
 ```
-# for i in $(seq 1 20); do echo "NUM_THREADS REPEAT" | optee_example_perf_concurrency; done
+# for i in $(seq 1 10); do echo "1 NUM_THREADS REPEAT" | optee_example_perf_concurrency; done
 ```
 
-Take the `Mean read concurrency` as the result.
+In our experiments, the `REPEAT` is 100 and the `NUM_THREADS` ranges from 1 to 128. Take the `Mean read concurrency` as the result.
 
-### 4.4 Reproduction of concurrent vulnerability
+### 4.4 Locking Mechanisms Comparison
+
+The original data are in `Locking_Mechanisms_Memory.csv` and `Locking_Mechanisms_Time.csv`, with averaged data in `Locking_Mechanisms_Memory_Averaged.csv` and `Locking_Mechanisms_Time_Averaged.csv` for statistical purposes.
+
+Run the following command with specific `NUM_THREADS` to measure the concurrency under different client threads:
+
+```
+# for i in $(seq 1 10); do echo "4 NUM_THREADS" | optee_example_perf_concurrency; done
+```
+In our experiments, the `NUM_THREADS` ranges from 1 to 128. Take the `Mutex mem bytes` and `Avg thread exec ms` as the result.
+
+To measure different locking mechanisms, cd `optee_client/libteec/src/` and replace `tee_client_api.c` with one of the follwing implementations:
+- global lock: `tee_client_api_global.c`
+- per-type lock: `tee_client_api_per_type.c`
+- per-object lock: `tee_client_api_per_object.c`
+- mutex pool: `tee_client_api_pool.c`
+
+Then redo the **compile and run** and subsequent steps.
+
+### 4.5 Reproduction of concurrent vulnerability
 
 To trigger double free in the `heap_vuln` PTA, run the following command in the normal world console:
 
@@ -247,7 +266,7 @@ make run -j$(nproc)
 
 otherwise *double free* will cause the Trusted OS to crash.
 
-### 4.5 Normalization
+### 4.6 Normalization
 
 For each test, obtain the results in native OP-TEE (`a`) and  *Freesia* (`b`) separately, and then take `b/a` as the normalized value.
 
@@ -259,3 +278,4 @@ Execute the following commands to restore the native OP-TEE environment:
 ```
 
 Then redo the **compile and run** and subsequent steps.
+
