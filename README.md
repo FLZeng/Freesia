@@ -82,14 +82,20 @@ The following commands can be executed in the ssh text interface, but remember t
 # curl https://storage.googleapis.com/git-repo-downloads/repo > /bin/repo && chmod a+x /bin/repo
 ```
 
-### 3.2 Unzip the data
+### 3.2 Get Freesia project
 
-Unzip the artifact archive and get a directory named *Freesia*.
+Unzip the artifact archive and get a directory named *Freesia*. Or you can clone *Freesia* from the repository:
+
+```
+# export FREESIA_DIR="/data/Freesia"
+# mkdir /data
+# git clone https://github.com/FLZeng/Freesia.git ${FREESIA_DIR}
+```
 
 ### 3.3 Sync OP-TEE source code
 
 ```
-# cd Freesia/Freesia_prototype
+# cd ${FREESIA_DIR}/Freesia_prototype
 # repo init -u https://github.com/OP-TEE/manifest.git -m qemu_v8.xml
 # cp common.xml .repo/manifests/common.xml
 # cp qemu_v8.xml .repo/manifests/qemu_v8.xml
@@ -99,19 +105,19 @@ Unzip the artifact archive and get a directory named *Freesia*.
 ### 3.4 Download toolchains
 
 ```
-# cd build
+# cd ${FREESIA_DIR}/Freesia_prototype/build
 # make toolchains -j2
 ```
 
 Add Cargo's bin directory in the PATH environment variable:
 ```
-# export PATH="/data/Freesia/Freesia_prototype/build/../toolchains/rust/.cargo/bin:$PATH"
+# export PATH="${FREESIA_DIR}/Freesia_prototype/build/../toolchains/rust/.cargo/bin:$PATH"
 ```
 
 ### 3.5 Apply Freesia pathes
 
 ```
-# cd ..
+# cd ${FREESIA_DIR}/Freesia_prototype
 # sh patches/apply_patches.sh
 ```
 
@@ -124,7 +130,7 @@ To enable build as root:
 
 Build and run:
 ```
-# cd build
+# cd ${FREESIA_DIR}/Freesia_prototype/build
 # make clean
 # KCFLAGS="-march=armv8.5-a+memtag" make MEMTAG=y run -j$(nproc)
 ```
@@ -305,7 +311,7 @@ For each test, obtain the results in native OP-TEE (`a`) and  *Freesia* (`b`) se
 Execute the following commands to restore the native OP-TEE environment:
 
 ```
-# cd Freesia_prototype
+# cd ${FREESIA_DIR}/Freesia_prototype
 # sh patches/revert_patches.sh
 ```
 
