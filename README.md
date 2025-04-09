@@ -2,7 +2,7 @@
 
 ## 1 Artifact Description
 
-The artifact of the *Freesia paper* includes the source code of *Freesia* prototype, the model and proofs of *Freesia*, and evaluation results. The directory structure is as follows:
+This is the artifact for the ISSTA 2025 paper *Freesia: Verifying Correctness of TEE Communication with Concurrent Separation Logic*. The artifact includes the source code of *Freesia* prototype, the model and proofs of *Freesia*, and evaluation results. The directory structure is as follows:
 
 ```
 |-- Freesia
@@ -16,6 +16,8 @@ The artifact of the *Freesia paper* includes the source code of *Freesia* protot
         |-- qemu_v8.xml             # manifest specifing the revision of dependencies
     |-- results                     # evaluation results data
 ```
+
+For ease of artifact evaluation and usage, we also provide a virtual machine image in qcow2 format.
 
 ## 2 Environment Setup
 
@@ -31,7 +33,36 @@ Notes:
 - The GUI must be installed on the Ubuntu because OP-TEE starts xterm when it runs.
 - For faster compilation, we recommend a processor with 8 cores or more.
 
+### 2.1 Pre-configured VM image
+
+A configured virtual machine image is provided and can be downloaded from: https://zenodo.org/record/15181173/files/freesia-ae.qcow2
+
+Create a VM with `virt-manager` (or `virt-install` command line) that meets the minimum configuration requirements and use the provided image as the disk for the VM. To create a virtual machine with `virt-install`:
+
+```
+virt-install \
+  --virt-type kvm \
+  --name freesia-ae \
+  --vcpus 8 \
+  --ram 8192 \
+  --disk path=/PATH/TO/freesia-ae.qcow2 \
+  --os-variant ubuntu23.10 \
+  --import \
+  --autostart \
+  --noautoconsole
+```
+
+Or you can convert the image to another format to run on VMWare Workstation (vmdk) or VirtualBox (vdi).
+
+The username for the VM is `root` and password is `123456`.
+
+This README file exists on the desktop of the `root` user of the VM.
+
 ## 3 Getting Started
+
+You can start from scratch or use the provided VM image.
+
+If you are using the provided VM image, the first 5 steps below are not required and you can skip to the **3.6 Compile and run** step.
 
 The following commands can be executed in the ssh text interface, but remember to log into the GUI with the same user first.
 
@@ -164,9 +195,9 @@ Segmentation fault
 
 The detailed evaluation experiments are described in the next section.
 
-## 4 Reproducibility Instructions
+## 4 Detailed Description
 
-The evaluation experiments include microbenchmarks, TA Benchmarks, and multi-thread TA Performance. The following commands are all executed in the normal world terminal.
+The evaluation experiments include microbenchmarks, TA Benchmarks, multi-thread TA Performance, and Locking Mechanisms Comparison. The following commands are all executed in the normal world terminal.
 
 The [`results/`](results/) directory contains all the experimental results data, which can be reproduced as follows.
 
@@ -249,7 +280,7 @@ To measure different locking mechanisms, cd `optee_client/libteec/src/` and repl
 - per-object lock: `tee_client_api_per_object.c`
 - mutex pool: `tee_client_api_pool.c`
 
-Then redo the **compile and run** and subsequent steps.
+Then redo the **3.6 Compile and run** and subsequent steps.
 
 ### 4.5 Reproduction of concurrent vulnerability
 
@@ -278,5 +309,4 @@ Execute the following commands to restore the native OP-TEE environment:
 # sh patches/revert_patches.sh
 ```
 
-Then redo the **compile and run** and subsequent steps.
-
+Then redo the **3.6 Compile and run** and subsequent steps.
