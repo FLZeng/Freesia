@@ -251,7 +251,7 @@ Take the `mean time (μs)` in the result.
 **Asym RSASSA-PSS**
 
 ```
-# xtest --asym-perf -a RSASSA_PKCS1_PSS_MGF1_SHA256_SIGN -r -k BUFFER_SIZE
+# for i in $(seq 1 10); do xtest --asym-perf -a RSASSA_PKCS1_PSS_MGF1_SHA256_SIGN -r -k BUFFER_SIZE; done
 ```
 
 Take the `mean time (μs)` in the result.
@@ -259,7 +259,7 @@ Take the `mean time (μs)` in the result.
 **Secure Storage**
 
 ```
-# xtest -t benchmark 1001 1002
+# for i in $(seq 1 10); do xtest -t benchmark 1001 1002; done
 ```
 
 Take the `Speed (kB/s)` in the result.
