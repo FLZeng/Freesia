@@ -161,9 +161,16 @@ Welcome to Buildroot, type root or test to login
 buildroot login:
 ```
 
+**Note**: whenever you change the compilation parameters, the legacy output files may cause compilation failure. Execute the following command to clean the compilation environment:
+
+```
+# make clean
+# rm -rf ${FREESIA_DIR}/Freesia_prototype/out ${FREESIA_DIR}/Freesia_prototype/out-br
+```
+
 ### 3.8 Examine basic functionality
 
-Run the test application:
+Run the test application in the normal world terminal:
 
 ```
 # optee_example_shared_mem
@@ -252,7 +259,7 @@ Take the `mean time (μs)` in the result.
 **Secure Storage**
 
 ```
-# xtest -t benchmark 1001 1002 | awk -v OFS="\t" '{print $3,$5}'
+# xtest -t benchmark 1001 1002
 ```
 
 Take the `Speed (kB/s)` in the result.
@@ -290,19 +297,37 @@ Then redo the **3.6 Compile and run** and subsequent steps.
 
 ### 4.5 Reproduction of concurrent vulnerability
 
-To trigger double free in the `heap_vuln` PTA, run the following command in the normal world console:
+Note that in order to trigger this vulnerability, the `MTE` must be disabled.
+
+Modify the relevant functions in `linux/arch/arm64/include/asm/uaccess.h` as follows:
+
+```c
+#define insert_random_tag(ptr) (ptr)
+#define set_tag(tagged_addr) do { } while (0)
+#define get_tag(tagged_addr) ((tagged_addr) & (0xful << 56))
+#define clear_tag(tagged_addr)
+```
+
+And recompile the project without `MTE option`:
 
 ```
-optee_example_heap_vuln
+# make clean
+# make run -j$(nproc)
 ```
 
-Note that in order to trigger this vulnerability, the `MTE option ` must be disabled at compile time:
+otherwise *double free* in the PTA will cause the Trusted OS to crash.
+
+Then run the following command in the normal world console:
 
 ```
-make run -j$(nproc)
+# optee_example_heap_vuln
 ```
 
-otherwise *double free* will cause the Trusted OS to crash.
+You are expected to see the following message in the output, indicating that the attacker has stolen the secret:
+
+```
+Secret: TOPSECRETTOPSECRETTOPSECRET
+```
 
 ### 4.6 Normalization
 
@@ -313,6 +338,7 @@ Execute the following commands to restore the native OP-TEE environment:
 ```
 # cd ${FREESIA_DIR}/Freesia_prototype
 # sh patches/revert_patches.sh
+# sh patches/apply_app_patches.sh
 ```
 
 Then redo the **3.6 Compile and run** and subsequent steps.
