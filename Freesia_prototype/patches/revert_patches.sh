@@ -7,7 +7,7 @@ PROJECTS="linux optee_client optee_examples optee_os"
 
 for project in $(echo ${PROJECTS})
 do
-    echo "Applying patches for [${project}] ... "
+    echo "Reverting patches for [${project}] ... "
     project_dir="${BASE_DIR}/${project}"
     patch_path="${PATCH_DIR}/${project}.patch"
     cd ${project_dir} && git restore --staged . && git restore . && git clean -fd
