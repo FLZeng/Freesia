@@ -299,7 +299,7 @@ Then redo the **3.6 Compile and run** and subsequent steps.
 
 Note that in order to trigger this vulnerability, the `MTE` must be disabled.
 
-Modify the relevant functions in `linux/arch/arm64/include/asm/uaccess.h` as follows:
+Append the following to the end of `linux/arch/arm64/include/asm/uaccess.h`:
 
 ```c
 #define insert_random_tag(ptr) (ptr)
