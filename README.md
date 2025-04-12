@@ -35,7 +35,7 @@ Notes:
 
 ### 2.1 Pre-configured VM image
 
-A configured virtual machine image is provided and can be downloaded from: https://zenodo.org/record/15181173/files/freesia-ae.qcow2
+A configured virtual machine image is provided and can be downloaded from: https://zenodo.org/records/15181173/files/freesia-ae.qcow2
 
 Create a VM with `virt-manager` (or `virt-install` command line) that meets the minimum configuration requirements and use the provided image as the disk for the VM. To create a virtual machine with `virt-install`:
 
